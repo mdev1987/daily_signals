@@ -1,0 +1,26 @@
+{
+  "name": "daily_signals",
+  "module": "src/main.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "bun check",
+    "start": "bun run src/main.ts",
+    "prices:once": "bun run src/collect-prices.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@alpacahq/alpaca-trade-api": "^5.0.0",
+    "@duckdb/node-api": "^2.0.0-r.1",
+    "biquote": "^0.3.0",
+    "cheerio": "^1.2.0",
+    "finnhub": "^2.0.15",
+    "grammy": "^1.46.0",
+    "telegram-markdown-v2": "^0.0.5"
+  }
+}
