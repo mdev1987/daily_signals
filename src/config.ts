@@ -30,10 +30,6 @@ export const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY!;
 
 export const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 
-if (!FINNHUB_API_KEY) {
-  throw new Error("FINNHUB_API_KEY is missing from .env");
-}
-
 export const TIMEFRAMES = [
   { name: "5m", time: 300 },
   { name: "15m", time: 900 },

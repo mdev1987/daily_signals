@@ -87,8 +87,19 @@ const results = symbols.map((label) => {
   const exact = catalogByName.get(normalize(label));
   const aliased = alias ? catalogByName.get(normalize(alias)) : undefined;
 
-  const match = exact ?? aliased;
-  const matchType = exact ? "EXACT" : aliased ? "ALIAS" : "UNMATCHED";
+  const exactActive =
+    exact && activeNames.has(normalize(exact.name)) ? exact : undefined;
+
+  const aliasActive =
+    aliased && activeNames.has(normalize(aliased.name)) ? aliased : undefined;
+
+  const match = exactActive ?? aliasActive ?? exact ?? aliased;
+
+  const matchType = match
+    ? match === exact
+      ? "EXACT"
+      : "ALIAS"
+    : "UNMATCHED";
 
   const status = match
     ? activeNames.has(normalize(match.name))
