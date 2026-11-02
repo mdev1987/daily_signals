@@ -120,6 +120,26 @@ export function savePoll(
   return serializedWrite(() => savePollUnlocked(connection, timeframe, signals));
 }
 
+export function getExpectedSignalCount(
+  connection: DatabaseConnection,
+  timeframe: string,
+): Promise<number> {
+  return serializedWrite(async () => {
+    const result = await connection.runAndReadAll(
+      `SELECT COUNT(*) AS total
+       FROM signals
+       WHERE timeframe = ?`,
+      [timeframe],
+    );
+
+    const row = result.getRowObjects()[0] as
+      | { total: number | bigint }
+      | undefined;
+
+    return Number(row?.total ?? 0);
+  });
+}
+
 async function savePollUnlocked(
   connection: DatabaseConnection,
   timeframe: string,

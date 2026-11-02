@@ -21,9 +21,20 @@ const SIGNAL_MAP: Record<string, SignalType> = {
   "strong sell": "STRONG_SELL",
 };
 
-export function parseSignals(html: string, timeframe: string): Signal[] {
+export interface ParsedSignalBatch {
+  signals: Signal[];
+  duplicateSymbols: string[];
+  conflictingSymbols: string[];
+}
+
+export function parseSignalsWithDiagnostics(
+  html: string,
+  timeframe: string,
+): ParsedSignalBatch {
   const $ = load(html);
   const signals = new Map<string, Signal>();
+  const duplicateSymbols = new Set<string>();
+  const conflictingSymbols = new Set<string>();
 
   $(".single_signal").each((_, element) => {
     const row = $(element);
@@ -41,15 +52,34 @@ export function parseSignals(html: string, timeframe: string): Signal[] {
 
     if (!symbol || !signal) return;
 
+    const previous = signals.get(symbol);
+
     // بعضی نمادها در بخش Top 8 و All Pairs تکرار شده‌اند.
-    if (!signals.has(symbol)) {
-      signals.set(symbol, {
-        symbol,
-        timeframe,
-        signal,
-      });
+    if (previous) {
+      duplicateSymbols.add(symbol);
+
+      if (previous.signal !== signal) {
+        conflictingSymbols.add(symbol);
+      }
+
+      return;
     }
+
+    signals.set(symbol, {
+      symbol,
+      timeframe,
+      signal,
+    });
   });
 
-  return [...signals.values()];
+  return {
+    signals: [...signals.values()],
+    duplicateSymbols: [...duplicateSymbols],
+    conflictingSymbols: [...conflictingSymbols],
+  };
+}
+
+// Keep compatibility with existing callers.
+export function parseSignals(html: string, timeframe: string): Signal[] {
+  return parseSignalsWithDiagnostics(html, timeframe).signals;
 }

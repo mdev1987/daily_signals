@@ -8,15 +8,65 @@ import {
 } from "./config";
 
 import { fetchSignalsPage } from "./fetcher";
-import { parseSignals } from "./parser";
-import { DATABASE_PATH, openDatabase, savePoll } from "./database";
+import { parseSignalsWithDiagnostics } from "./parser";
+import {
+  DATABASE_PATH,
+  openDatabase,
+  savePoll,
+  getExpectedSignalCount,
+} from "./database";
 import { runPriceCollector } from "./price-collector";
-import { notifySignalChanges, notifyStartup } from "./telegram";
+import {
+  notifySignalChanges,
+  notifyStartup,
+  telegram,
+} from "./telegram";
 
 const connection = await openDatabase();
 const stopCollector = new AbortController();
 
 let running = true;
+
+const POLL_COMPLETENESS_THRESHOLD = 0.95;
+const POLL_FAILURE_ALERT_THRESHOLD = 5;
+
+interface PollGuardState {
+  consecutiveFailures: number;
+  alerted: boolean;
+}
+
+const pollGuardState = new Map<string, PollGuardState>();
+
+function rejectPoll(timeframe: string, reason: string): void {
+  const state = pollGuardState.get(timeframe) ?? {
+    consecutiveFailures: 0,
+    alerted: false,
+  };
+
+  state.consecutiveFailures++;
+
+  pollGuardState.set(timeframe, state);
+
+  console.warn(
+    `[GUARD] ${timeframe}: ${reason} | ` +
+      `consecutive failures: ${state.consecutiveFailures}`,
+  );
+
+  if (
+    state.consecutiveFailures >= POLL_FAILURE_ALERT_THRESHOLD &&
+    !state.alerted
+  ) {
+    state.alerted = true;
+
+    void telegram(
+      `# ⚠️ Incomplete Signal Polls\n\n` +
+        `**Timeframe:** ${timeframe}\n` +
+        `**Consecutive failures:** ${state.consecutiveFailures}\n` +
+        `**Reason:** ${reason}\n\n` +
+        `Signal data was rejected. The previous database state is preserved.`,
+    );
+  }
+}
 
 process.on("SIGINT", () => {
   console.log("\n[ENGINE] Stopping...");
@@ -53,13 +103,48 @@ async function pollTimeframe(
 ): Promise<void> {
   try {
     const html = await fetchSignalsPage(timeframe.time);
-    const signals = parseSignals(html, timeframe.name);
 
+    const parsed = parseSignalsWithDiagnostics(html, timeframe.name);
+
+    const signals = parsed.signals;
+
+    // Reject empty responses.
     if (signals.length === 0) {
-      throw new Error("No signals parsed. Database was not updated.");
+      rejectPoll(timeframe.name, "No valid signals parsed");
+      return;
     }
 
+    // Repeated rows are normal in Top 8 / All Pairs.
+    // Conflicting values for the same symbol are not.
+    if (parsed.conflictingSymbols.length > 0) {
+      rejectPoll(
+        timeframe.name,
+        `Conflicting duplicate symbols: ${parsed.conflictingSymbols.join(", ")}`,
+      );
+      return;
+    }
+
+    // Read expected count from the last successfully saved state.
+    const expected = await getExpectedSignalCount(connection, timeframe.name);
+
+    if (expected > 0) {
+      const minimum = Math.ceil(expected * POLL_COMPLETENESS_THRESHOLD);
+
+      if (signals.length < minimum) {
+        rejectPoll(
+          timeframe.name,
+          `Incomplete ${signals.length}/${expected} ` +
+            `(minimum ${minimum})`,
+        );
+        return;
+      }
+    }
+
+    // Only valid polls reach the database.
     const result = await savePoll(connection, timeframe.name, signals);
+
+    // A successful poll resets the consecutive failure counter.
+    pollGuardState.delete(timeframe.name);
 
     for (const item of result.changes) {
       logChange(
@@ -71,15 +156,18 @@ async function pollTimeframe(
     }
 
     if (result.changes.length > 0) {
-      // Notifications must never delay or break the signal polling cycle.
+      // Notifications must never delay or break polling.
       void notifySignalChanges(result.changes);
     }
 
     console.log(
-      `[POLL] ${timeframe.name}: ${signals.length} signals` +
+      `[POLL] ${timeframe.name}: ${signals.length}/${expected || signals.length} signals` +
         (result.initialized
           ? " | baseline saved"
-          : ` | ${result.changes.length} changes`),
+          : ` | ${result.changes.length} changes`) +
+        (parsed.duplicateSymbols.length > 0
+          ? ` | ${parsed.duplicateSymbols.length} repeated rows ignored`
+          : ""),
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
