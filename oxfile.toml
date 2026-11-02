@@ -13,9 +13,9 @@ version = 1
 
 [[apps]]
 name = "daily-signals"
-## Bun loads .env automatically, so no secrets are duplicated in this file.
-## Absolute path keeps the daemon independent from the interactive-shell PATH.
-command = "/usr/bin/bun run src/main.ts"
+## Bun may live in /usr/bin (local) or ~/.bun/bin (VPS), so resolve it through
+## one wrapper instead of hardcoding a machine-specific path.
+command = "/bin/sh ./scripts/bun.sh run src/main.ts"
 cwd = "/home/mdev/Programming/daily_signals"
 restart_policy = "always"
 max_restarts = 100
@@ -29,15 +29,15 @@ stop_signal = "SIGTERM"
 stop_timeout_secs = 120
 ## The signal loop logs every cycle (60s by default), so a log file older than
 ## 5 minutes means the process is wedged. A missing file is a fresh boot.
-health_cmd = "/bin/sh -c 'test ! -f /home/mdev/.local/share/oxmgr/logs/daily-signals.log || test -n \"$(/usr/bin/find /home/mdev/.local/share/oxmgr/logs/daily-signals.log -mmin -5 2>/dev/null)\"'"
+health_cmd = "/bin/sh -c 'test ! -f /home/mdev/.local/share/oxmgr/logs/daily-signals.log || test -n \"$(find /home/mdev/.local/share/oxmgr/logs/daily-signals.log -mmin -5 2>/dev/null)\"'"
 health_interval_secs = 60
 health_timeout_secs = 5
 health_max_failures = 3
 ## Dependencies must resolve before a reload cuts over; a failed sync aborts
 ## the reload and leaves the old process running.
-pre_reload_cmd = "/bin/sh -c 'cd /home/mdev/Programming/daily_signals && /usr/bin/bun install --frozen-lockfile'"
+pre_reload_cmd = "/bin/sh -c 'cd /home/mdev/Programming/daily_signals && ./scripts/bun.sh install --frozen-lockfile'"
 unified_logs = true
 
 [apps.env]
-PATH = "/usr/local/bin:/usr/bin:/bin:/home/mdev/.local/bin"
+PATH = "/home/mdev/.bun/bin:/home/mdev/.local/bin:/usr/local/bin:/usr/bin:/bin"
 HOME = "/home/mdev"
