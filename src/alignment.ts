@@ -6,8 +6,13 @@
  * latest such candle is selected, which guarantees no look-ahead bias. A
  * candle is only usable when its close happened within the candle interval of
  * the signal timeframe; larger delays mark the pair STALE.
+ *
+ * Snapshots are stored under the signal-side symbol name while candles are
+ * stored under the canonical Biquote instrument, so every snapshot is first
+ * resolved to its canonical instrument before the candle lookup happens.
  */
 
+import { loadMappedSymbols } from "./biquote";
 import type { DatabaseConnection } from "./database";
 
 export type AlignmentStatus = "FRESH" | "STALE" | "UNMATCHED" | "UNSUPPORTED";
@@ -35,6 +40,27 @@ const CANDLE_INTERVAL_MS: Record<string, number> = {
   "5h": 18_000_000,
   "1w": 604_800_000,
 };
+
+let mappedSymbolsCache: Awaited<ReturnType<typeof loadMappedSymbols>> | null = null;
+
+/**
+ * Resolves a signal symbol to its canonical Biquote instrument. Signal
+ * snapshots use human-friendly names (`Alphabet A`) while collected candles
+ * are stored under the canonical instrument (`GOOGL`), so alignment has to
+ * compare canonical identities. Unknown symbols map to themselves.
+ */
+async function resolveCanonicalSymbol(symbol: string): Promise<string> {
+  if (!mappedSymbolsCache) {
+    mappedSymbolsCache = await loadMappedSymbols();
+  }
+
+  const key = symbol.toUpperCase();
+  const mapping = mappedSymbolsCache.find(
+    (entry) => entry.original.toUpperCase() === key,
+  );
+
+  return mapping ? mapping.symbol : symbol;
+}
 
 export function candleIntervalMs(timeframe: string): number | undefined {
   return CANDLE_INTERVAL_MS[timeframe];
@@ -110,8 +136,9 @@ export async function alignTimeframe(
     const symbol = String(row.symbol);
     const signal = String(row.signal);
     const observedAt = Number(row.observed_at);
+    const canonicalSymbol = await resolveCanonicalSymbol(symbol);
 
-    const candles = candlesBySymbol.get(symbol) ?? [];
+    const candles = candlesBySymbol.get(canonicalSymbol) ?? [];
 
     let best: { open_time: number; close_time: number; candle_close: number } | null =
       null;
