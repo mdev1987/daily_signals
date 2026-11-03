@@ -49,7 +49,7 @@ let mappedSymbolsCache: Awaited<ReturnType<typeof loadMappedSymbols>> | null = n
  * are stored under the canonical instrument (`GOOGL`), so alignment has to
  * compare canonical identities. Unknown symbols map to themselves.
  */
-async function resolveCanonicalSymbol(symbol: string): Promise<string> {
+export async function resolveCanonicalSymbol(symbol: string): Promise<string> {
   if (!mappedSymbolsCache) {
     mappedSymbolsCache = await loadMappedSymbols();
   }

@@ -17,7 +17,7 @@
  */
 
 import type { DatabaseConnection } from "./database";
-import { alignTimeframe, candleIntervalMs, type AlignedSignal } from "./alignment";
+import { alignTimeframe, candleIntervalMs, resolveCanonicalSymbol, type AlignedSignal } from "./alignment";
 import type { PriceCandle } from "./biquote";
 
 /** Forward return horizons, in number of candles after the entry candle. */
@@ -282,6 +282,19 @@ export async function evaluateTimeframe(
   const transitions = computeTransitions(timeframe, aligned);
   const candlesBySymbol = await loadCandlesBySymbol(connection, timeframe);
 
+  // Candles are stored under canonical Biquote instrument names while
+  // transitions keep the signal-side symbol, so forward-return lookups have to
+  // resolve the canonical instrument as well.
+  const candlesByCanonical = new Map<string, EvaluationCandle[]>();
+  for (const [symbol, list] of candlesBySymbol.entries()) {
+    const canonical = await resolveCanonicalSymbol(symbol);
+    const bucket = candlesByCanonical.get(canonical) ?? [];
+    for (const candle of list) {
+      bucket.push(candle);
+    }
+    candlesByCanonical.set(canonical, bucket);
+  }
+
   const freshTransitions = transitions.filter((t) => t.fresh);
   const directionalTransitions = freshTransitions.filter(
     (t) => isBullish(t.currentSignal) || isBearish(t.currentSignal),
@@ -295,9 +308,11 @@ export async function evaluateTimeframe(
 
     if (!isBullish(signal) && !isBearish(signal)) continue;
 
+    const canonicalSymbol = await resolveCanonicalSymbol(transition.symbol);
+
     // E1: immediate theoretical entry at the closing price of the fresh candle.
     e1Samples.push({
-      symbol: transition.symbol,
+      symbol: canonicalSymbol,
       signal,
       entryPrice: transition.candleClose ?? Number.NaN,
       entryTime: transition.candleCloseTime ?? Number.NaN,
@@ -306,20 +321,20 @@ export async function evaluateTimeframe(
     // E2: transition plus the documented waiting period, entering at the first
     // available price after the waiting period ends.
     const waitEnd = transition.observedAt + ENTRY_DELAY_MS;
-    const candles = candlesBySymbol.get(transition.symbol) ?? [];
+    const candles = candlesByCanonical.get(canonicalSymbol) ?? [];
     const firstCandleAfterWait = candles.find((c) => c.closeTime > waitEnd);
     const entryPrice = firstCandleAfterWait ? firstCandleAfterWait.close : Number.NaN;
 
     e2Samples.push({
-      symbol: transition.symbol,
+      symbol: canonicalSymbol,
       signal,
       entryPrice,
       entryTime: waitEnd,
     });
   }
 
-  const e1 = computeForwardReturnStats(e1Samples, candlesBySymbol, FORWARD_RETURN_HORIZONS);
-  const e2 = computeForwardReturnStats(e2Samples, candlesBySymbol, FORWARD_RETURN_HORIZONS);
+  const e1 = computeForwardReturnStats(e1Samples, candlesByCanonical, FORWARD_RETURN_HORIZONS);
+  const e2 = computeForwardReturnStats(e2Samples, candlesByCanonical, FORWARD_RETURN_HORIZONS);
 
   return {
     timeframe,
