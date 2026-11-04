@@ -137,3 +137,42 @@ Only after all three stages should this specification be revised — and only if
 ## 9. Next Action
 
 Proceed to Phase 5 (Build the First Paper Backtester) using this frozen specification. Do not modify rules based on backtest results until out-of-sample validation is complete.
+
+---
+
+## 10. E3 — Price Confirmation (Frozen Research Rule)
+
+**Status:** Frozen for the E3 research experiment (accepted 2026-11-04). The E2 entry rule above is unchanged and remains the candidate strategy entry pending the E1/E2/E3 comparison.
+
+### 10.1 Frozen Confirmation Rule
+
+| Signal direction   | Confirmation condition     |
+| ------------------ | -------------------------- |
+| BUY / STRONG_BUY   | Close ≥ reference × 1.0001 |
+| SELL / STRONG_SELL | Close ≤ reference × 0.9999 |
+
+### 10.2 Components
+
+| Component | Requirement |
+| --- | --- |
+| Reference price | E1 reference entry price |
+| Confirmation timing | After the E2 five-minute waiting period |
+| Candle type | Closed candles only |
+| Direction | Confirmation must occur in the signal direction |
+| No confirmation | No E3 entry |
+
+### 10.3 Threshold
+
+- Fixed confirmation threshold: `0.0001` (fractional price movement).
+- Accepted as final for the E3 research experiment; no historical-performance-based adjustment.
+- Note: normalized `0.0001` is a fractional price movement and is not necessarily one conventional pip for instruments such as JPY pairs, equities, or crypto; the rule is defined as a fractional movement rather than claiming universal pip equivalence.
+
+### 10.4 Versioned Change Record
+
+| Version | Date | Change |
+| ------- | ---- | ------ |
+| 1.1 | 2026-11-04 | E3 price-confirmation research rule added (BUY ≥ ref×1.0001 / SELL ≤ ref×0.9999; threshold fixed at `0.0001`). E2 entry rule unchanged. Accepted following statistical assessment; final comparison to E1/E2 deferred until this frozen threshold was accepted. |
+
+### 10.5 Next Action
+
+Execute E3 with the frozen threshold, preserve output/config, compare E1/E2/E3, decide E3 inclusion, then proceed to the next validation stage (paper backtester pending).
