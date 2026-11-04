@@ -108,6 +108,33 @@ Before considering Phase 7 (Live Paper Trading), the strategy must demonstrate:
 
 ---
 
-## 8. Next Action
+## Final Distinction: Preservation, Execution, Interpretation
+
+These three must remain separate:
+
+**Preservation (locked before any run):**
+- Dataset fingerprint, date boundaries, symbol universe
+- Acceptance criteria (minimum sample, thresholds, drawdown limits, consistency, robustness)
+- Risk scenarios (baseline, moderate, stress)
+- Frozen specification (`verifyFrozenSpec()` must return `true`)
+- Evaluation protocol (metrics, cost assumptions, missing-data rules)
+
+**Execution (recorded for every run):**
+- Exact inputs: dataset fingerprint, frozen spec version, scenario, date boundaries
+- Exact outputs: all metrics, per-timeframe/per-signal/per-symbol results, gross vs. net
+- Any failure (incomplete dataset, missing candles, rejected entries) recorded as-is — not silently corrected
+- No parameter or threshold changes between runs
+
+**Interpretation (applied only after execution is complete):**
+- Results classified against predefined acceptance criteria — not judged by appearance
+- If criteria fail: conclusion is "strategy does not meet predefined standard"
+- If criteria pass: conclusion is "strategy passes out-of-sample validation" — not "strategy is profitable"
+- No profitability claim warranted until Phase 7 (paper trading) confirms operational reliability
+
+**Rule:** If a dataset is incomplete or a run fails, record the failure. Do not change the dataset, protocol, or criteria to make the evaluation succeed.
+
+---
+
+## 9. Next Action
 
 Proceed to Phase 6 evaluation using the frozen dataset, frozen specification, predefined scenarios, and locked acceptance criteria. Do not adjust any parameter, threshold, or criterion after the first results are examined.
