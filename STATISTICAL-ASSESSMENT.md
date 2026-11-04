@@ -95,6 +95,31 @@ The following were requested but not yet finalized in the committed module/docs:
 
 ---
 
-## 8. Next Step
+## 8. E3 — Price Confirmation (Provisional / Exploratory)
 
-Proceed to **E3** (price-confirmation / pip threshold) once the outstanding assessment items are closed, per the project roadmap.
+**Status:** Exploratory — run with provisional pip threshold. **Not for final decision-making.**
+
+| Field | Value |
+|---|---|
+| Experiment | E3: main-timeframe transition followed by price confirmation |
+| Pip threshold (provisional) | 0.0001 |
+| Run command | `bun run src/e3-cli.ts 0.0001` (all six timeframes) |
+| Output file | `/tmp/opencode/e3_run_out.txt` |
+
+### 8.1 Labeling and use
+
+- The E3 results in Section 8 are **provisional/exploratory**.
+- They must **not** influence the final strategy decision.
+- The final E1 vs E2 vs E3 comparison is **deferred** until the E3 pip threshold is **frozen** by the strategy owner.
+- Exploratory comparisons using provisional thresholds are acceptable for hypothesis generation only.
+
+### 8.2 Pending steps
+
+1. Freeze the final E3 pip threshold based on the intended price-confirmation rule.
+2. Run `bun run e3 <finalThreshold>`.
+3. Preserve E3 output and configuration.
+4. Compare E1 vs E2 vs E3 on identical samples.
+
+## 9. Next Step
+
+Proceed to the final E1 vs E2 vs E3 comparison after the E3 pip threshold is frozen, followed by the paper backtester, out-of-sample validation, paper trading, and live decision per the project roadmap.
