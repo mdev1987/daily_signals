@@ -96,7 +96,7 @@ export interface TradeRecord {
   entryPrice: number;
   exitTime: number | null;
   exitPrice: number | null;
-  exitReason: "stop" | "target" | "reversal" | "time" | "open" | "trailing";
+  exitReason: "stop" | "target" | "reversal" | "time" | "open" | "trailing" | "mark";
   grossPnL: number;
   netPnL: number;
   fees: number;
@@ -297,6 +297,30 @@ export async function runBacktest(
       trade.status = "closed";
       closedTrades.push(trade);
     }
+  }
+
+  // Phase 5: end-of-data mark-to-market liquidation of open positions at the
+  // last observed candle close, for closed-trade accounting. This is evaluation
+  // accounting only (realized PnL at period end); it is not a change to the
+  // frozen exit rules (stop-loss / take-profit / trailing stop / time-based).
+  for (const trade of [...openPositions]) {
+    if (trade.status !== "open") continue;
+    const candles = candlesByCanonical.get(trade.symbol) ?? [];
+    const last = [...candles].reverse().find((c) => c.closeTime > trade.entryTime);
+    if (!last) continue;
+    const dirMult = trade.direction === "long" ? 1 : -1;
+    const gross = (last.close - trade.entryPrice) * dirMult;
+    const fees = Math.abs(trade.entryPrice) * scenario.transactionCostPct / 100;
+    const slippage = Math.abs(trade.entryPrice) * scenario.slippagePct / 100;
+    trade.exitTime = last.closeTime;
+    trade.exitPrice = last.close;
+    trade.exitReason = "mark";
+    trade.grossPnL = gross;
+    trade.netPnL = gross - fees - slippage;
+    trade.fees = fees;
+    trade.slippage = slippage;
+    trade.holdingPeriodMs = last.closeTime - trade.entryTime;
+    trade.status = "closed";
   }
 
   const metrics = computeMetrics(trades, scenario);
