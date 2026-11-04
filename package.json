@@ -6,7 +6,9 @@
   "scripts": {
     "typecheck": "bun check",
     "start": "bun run src/main.ts",
-    "prices:once": "bun run src/collect-prices.ts"
+    "prices:once": "bun run src/collect-prices.ts",
+    "validate": "bun run src/validate.ts",
+    "e4": "bun run src/e4-cli.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

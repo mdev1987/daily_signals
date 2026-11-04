@@ -70,7 +70,7 @@ export interface SignalEvaluationResult {
   e2: ForwardReturnStats;
 }
 
-interface EvaluationCandle {
+export interface EvaluationCandle {
   openTime: number;
   closeTime: number;
   open: number;
