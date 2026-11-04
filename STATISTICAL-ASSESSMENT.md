@@ -95,31 +95,34 @@ The following were requested but not yet finalized in the committed module/docs:
 
 ---
 
-## 8. E3 — Price Confirmation (Provisional / Exploratory)
+## 8. E3 — Price Confirmation (Frozen Threshold; Final Run Executed)
 
-**Status:** Exploratory — run with provisional pip threshold. **Not for final decision-making.**
+**Status:** E3 threshold frozen at 0.0001; final run executed; final E1 vs E2 vs E3 comparison authorized. Results below come from the final run and are subject to that comparison.
 
 | Field | Value |
 |---|---|
 | Experiment | E3: main-timeframe transition followed by price confirmation |
-| Pip threshold (provisional) | 0.0001 |
+| Pip threshold (frozen) | 0.0001 |
 | Run command | `bun run src/e3-cli.ts 0.0001` (all six timeframes) |
-| Output file | `/tmp/opencode/e3_run_out.txt` |
+| Output file | `/tmp/opencode/e3_final_out.txt` |
 
-### 8.1 Labeling and use
+### 8.1 Current status
 
-- The E3 results in Section 8 are **provisional/exploratory**.
-- They must **not** influence the final strategy decision.
-- The final E1 vs E2 vs E3 comparison is **deferred** until the E3 pip threshold is **frozen** by the strategy owner.
-- Exploratory comparisons using provisional thresholds are acceptable for hypothesis generation only.
+- Threshold frozen (accepted 2026-11-04; fractional movement 0.0001; BUY ≥ ref×1.0001 / SELL ≤ ref×0.9999).
+- Final run executed at frozen threshold; output preserved at `/tmp/opencode/e3_final_out.txt`.
+- Final E1 vs E2 vs E3 comparison is now authorized.
 
-### 8.2 Pending steps
+### 8.2 Labeling and use
 
-1. Freeze the final E3 pip threshold based on the intended price-confirmation rule.
-2. Run `bun run e3 <finalThreshold>`.
-3. Preserve E3 output and configuration.
-4. Compare E1 vs E2 vs E3 on identical samples.
+- Results from the final run are current; prior Section-8 results were provisional.
+- They must not influence the final strategy decision before the comparative assessment is complete.
+
+### 8.3 Pending steps
+
+1. Conduct final E1 vs E2 vs E3 comparison on identical eligible samples.
+2. Report gross/net returns, coverage, drawdown, statistical uncertainty.
+3. Decide whether E3 merits inclusion.
 
 ## 9. Next Step
 
-Proceed to the final E1 vs E2 vs E3 comparison after the E3 pip threshold is frozen, followed by the paper backtester, out-of-sample validation, paper trading, and live decision per the project roadmap.
+After completing the E1/E2/E3 comparison and deciding on E3 inclusion, proceed to the paper backtester, out-of-sample validation, paper trading, and live decision per the project roadmap.
