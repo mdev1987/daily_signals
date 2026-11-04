@@ -6,15 +6,17 @@
 
 ## 1. Dataset Preservation (Locked Before Testing)
 
-| Element | Requirement |
-|---|---|
-| Historical data | Exact `data/signals.duckdb` file; no updates after lock |
-| Date boundaries | Development period, validation period, final untouched test period — defined chronologically |
-| Symbol universe | Fixed list of canonical instruments; no additions or removals |
-| Data fingerprint | Checksum or version identifier recorded before any evaluation |
-| Lock timestamp | Recorded; dataset frozen at this point |
+| Element | Requirement | Phase 6 Lock (2026-11-04) |
+|---|---|---|
+| Historical data | Exact `data/signals.duckdb` file; no updates after lock | `data/signals.duckdb`, SHA-256 `fcc8504ac77b208549295dd63ff254984696f8ea293036cce30fda36ee7cbc55`, locked at `2026-11-04T04:01:35Z UTC` after `oxmgr stop daily-signals` (writer stopped; no active writer at lock) |
+| Date boundaries | Development period, validation period, final untouched test period — defined chronologically | Frozen observation window: `2026-11-02T19:39:37Z` → `2026-11-04T03:56:12Z` (min/max across `signal_history` / `signal_snapshots`); full window designated for Phase 6 first run pending final split decision |
+| Symbol universe | Fixed list of canonical instruments; no additions or removals | 153 symbols observed in `signals`; canonical mapping applied via Biquote mapping layer; fixed for this run |
+| Data fingerprint | Checksum or version identifier recorded before any evaluation | `fcc8504ac77b208549295dd63ff254984696f8ea293036cce30fda36ee7cbc55` (SHA-256 of `data/signals.duckdb`) |
+| Lock timestamp | Recorded; dataset frozen at this point | `2026-11-04T04:01:35Z UTC` (after service stop; DB writer inactive) |
 
 **Rule:** Once the dataset fingerprint is recorded, any change to the database invalidates the out-of-sample evaluation.
+
+**Lock status:** ✅ Recorded 2026-11-04 (Phase 6 entry; service stopped before hash computation; no writes after lock).
 
 ---
 
@@ -88,6 +90,21 @@ Every Phase 6 evaluation must be recorded with:
 | Results | Metrics per scenario |
 | Acceptance criteria met | Yes/No per criterion |
 | Conclusion | Whether strategy passes out-of-sample validation |
+
+### Phase 6 Run Record — Run 1 (2026-11-04)
+
+| Record Field | Value |
+|---|---|
+| Run ID | Phase6-Run1-20261104-0410 |
+| Timestamp | 2026-11-04T04:10:00Z UTC (started after Phase 6 lock; DB frozen) |
+| Dataset fingerprint | `fcc8504ac77b208549295dd63ff254984696f8ea293036cce30fda36ee7cbc55` (`data/signals.duckdb`) |
+| Frozen spec version | `PHASE-4-STRATEGY-SPEC.md` (E2 entry, frozen rules) |
+| Risk scenarios used | Baseline, Moderate, Stress (Phase 5 `RISK_SCENARIOS`) |
+| Date boundaries | Frozen observation window: `2026-11-02T19:39:37Z` → `2026-11-04T03:56:12Z` |
+| Symbol universe | 153 symbols (canonical Biquote mapping applied); run executed on EUR/USD only (all generated trades) |
+| Results | Baseline: 10 closed trades (mark-to-market), winRate 0.10, net -0.045, gross return -0.0000045. Moderate: 3 closed, winRate 0.33, net -0.0081. Stress: 2 closed, winRate 0.5, net -0.0048. All closed via end-of-data mark-to-market; no exit-rule-triggered closes. |
+| Acceptance criteria met | See §7 — No (preliminary single run; small closed-sample) |
+| Conclusion | Strategy did not pass out-of-sample validation (preliminary run 1) |
 
 **Rule:** All records preserved; no deletion or modification after results are visible.
 
