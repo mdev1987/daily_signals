@@ -1,5 +1,5 @@
 import finnhub from "finnhub";
-import { FINNHUB_API_KEY } from "./config";
+import { FINNHUB_API_KEY } from "../config";
 
 const client = new finnhub.DefaultApi(FINNHUB_API_KEY);
 
