@@ -345,3 +345,62 @@ export async function evaluateTimeframe(
     e2,
   };
 }
+
+/**
+ * E3: main-timeframe transition followed by price confirmation.
+ *
+ * Unlike E1 (immediate theoretical entry at the fresh candle close) and E2
+ * (entry at the first available candle after the documented waiting period),
+ * E3 waits for a price confirmation: after the documented waiting period, the
+ * first candle whose close confirms the directional move by at least
+ * `pipThresholdPct` (fraction of price) from the transition reference is used
+ * as the entry.
+ *
+ * Read-only: no writes, no persistence. The pip threshold is an input to the
+ * experiment and must be defined by the strategy owner before E3 conclusions
+ * are drawn.
+ */
+export async function evaluateE3(
+  connection: DatabaseConnection,
+  timeframe: string,
+  pipThresholdPct: number,
+): Promise<{ timeframe: string; pipThresholdPct: number; e3: ForwardReturnStats }> {
+  const aligned = await alignTimeframe(connection, timeframe);
+  const transitions = computeTransitions(timeframe, aligned).filter(
+    (t) => t.fresh && (isBullish(t.currentSignal) || isBearish(t.currentSignal)),
+  );
+
+  const candlesBySymbol = await loadCandlesBySymbol(connection, timeframe);
+  const candlesByCanonical = new Map<string, EvaluationCandle[]>();
+  for (const [symbol, list] of candlesBySymbol.entries()) {
+    const canonical = await resolveCanonicalSymbol(symbol);
+    const bucket = candlesByCanonical.get(canonical) ?? [];
+    for (const candle of list) bucket.push(candle);
+    candlesByCanonical.set(canonical, bucket);
+  }
+
+  const samples: ForwardReturnSample[] = [];
+  for (const transition of transitions) {
+    const canonicalSymbol = await resolveCanonicalSymbol(transition.symbol);
+    const candles = candlesByCanonical.get(canonicalSymbol) ?? [];
+    const reference = transition.candleClose ?? Number.NaN;
+    const waitEnd = transition.observedAt + ENTRY_DELAY_MS;
+    const entryCandle = candles.find(
+      (c) =>
+        c.closeTime > waitEnd &&
+        !Number.isNaN(reference) &&
+        ((isBullish(transition.currentSignal) && c.close >= reference * (1 + pipThresholdPct)) ||
+          (isBearish(transition.currentSignal) && c.close <= reference * (1 - pipThresholdPct))),
+    );
+    if (entryCandle === undefined) continue;
+    samples.push({
+      symbol: canonicalSymbol,
+      signal: transition.currentSignal,
+      entryPrice: entryCandle.close,
+      entryTime: entryCandle.closeTime,
+    });
+  }
+
+  const e3 = computeForwardReturnStats(samples, candlesByCanonical, FORWARD_RETURN_HORIZONS);
+  return { timeframe, pipThresholdPct, e3 };
+}
