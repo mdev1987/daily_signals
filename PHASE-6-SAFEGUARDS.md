@@ -155,3 +155,38 @@ These three must remain separate:
 ## 9. Next Action
 
 Proceed to Phase 6 evaluation using the frozen dataset, frozen specification, predefined scenarios, and locked acceptance criteria. Do not adjust any parameter, threshold, or criterion after the first results are examined.
+
+---
+
+## 10. Phase 6 Run 1 Conclusion (2026-11-04)
+
+**Run:** Phase6-Run1-20261104-0410 (out-of-sample validation, E2 entry on frozen 5m timeframe, frozen risk scenarios, end-of-data mark-to-market liquidation for closed-trade accounting).
+
+**Results summary:**
+
+| Scenario | Closed trades | Win rate | Expectancy | Net profit | Gross return | Status |
+|---|---|---|---|---|---|---|
+| Baseline | 10 | 0.10 | -0.0045 | -0.045 | -0.0000045 | All closed (mark) |
+| Moderate | 3 | 0.33 | -0.0019 | -0.0081 | -0.0000006 | All closed (mark) |
+| Stress | 2 | 0.50 | -0.00016 | -0.0048 | -0.00000003 | All closed (mark) |
+
+**Acceptance criteria evaluation (Run 1):**
+
+| Criterion (Phase 6 / Phase 4 spec) | Outcome | Note |
+|---|---|---|
+| 1. Repeatable out-of-sample performance on untouched test data | ❌ Not established (single run; frozen fingerprint recorded) | Run executed on locked dataset; repeatability pending |
+| 2. Positive net return after realistic costs (moderate scenario) | ❌ Failed | Net negative across all scenarios; moderate net -0.0081 (3 closed trades) |
+| 3. Acceptable drawdown characteristics | ⚠️ Not properly computable | Backtester reports drawdown as 0 placeholder; not evaluable as acceptable |
+| 4. Consistency across instruments | ❌ Failed | All closed trades on EUR/USD (single instrument) |
+| 5. Stable behavior under different market conditions | ❌ Not established | Insufficient closed-trade sample (2-10 trades) |
+| 6. Reliable paper-trading execution (Phase 7) | ⏸ Pending Phase 7 | Not applicable to this run |
+
+**Conclusion:** With Run 1, the strategy **does not meet the predefined out-of-sample standard**. Preliminary result: no profitability after costs; negative expectancy; insufficient sample and concentration on a single instrument.
+
+**Next action:** Do not advance to Phase 7 (live paper trading) based on Run 1. Phase 7 requires demonstration of the Phase 6 acceptance criteria (per PHASE-6-SAFEGUARDS §7); the criteria were not met in Run 1.
+
+---
+
+## 11. Phase 6 Next Action
+
+Re-run Phase 6 only after adding sufficient out-of-sample observations (new data period) or revising the strategy entry methodology under the Phase 4 freeze process; do not adjust frozen rules to force acceptance.
