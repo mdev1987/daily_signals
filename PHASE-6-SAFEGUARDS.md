@@ -1,0 +1,113 @@
+# Phase 6 — Out-of-Sample Validation Safeguards
+
+**Status:** Ready — must not be modified after first results are visible.
+
+---
+
+## 1. Dataset Preservation (Locked Before Testing)
+
+| Element | Requirement |
+|---|---|
+| Historical data | Exact `data/signals.duckdb` file; no updates after lock |
+| Date boundaries | Development period, validation period, final untouched test period — defined chronologically |
+| Symbol universe | Fixed list of canonical instruments; no additions or removals |
+| Data fingerprint | Checksum or version identifier recorded before any evaluation |
+| Lock timestamp | Recorded; dataset frozen at this point |
+
+**Rule:** Once the dataset fingerprint is recorded, any change to the database invalidates the out-of-sample evaluation.
+
+---
+
+## 2. Acceptance Criteria (Locked Before Testing)
+
+These criteria must be defined and recorded before any Phase 6 results are examined:
+
+| Criterion | Requirement |
+|---|---|
+| Minimum sample size | Per-timeframe, per-signal minimum number of completed trades |
+| Performance threshold | Net return must exceed a predefined minimum after moderate costs |
+| Drawdown limit | Maximum acceptable peak-to-trough equity decline |
+| Consistency | Positive results must be distributed across instruments, not concentrated |
+| Robustness | Strategy must remain viable under stress cost scenario |
+| Statistical reliability | Results must survive symbol-level and time-block resampling |
+
+**Rule:** Acceptance criteria cannot be adjusted after results are visible. If results fail, the conclusion is that the strategy does not meet the predefined standard — not that the standard should be changed.
+
+---
+
+## 3. Risk Scenario Lock
+
+The three predefined scenarios from Phase 4 must be preserved exactly:
+
+| Scenario | Transaction Cost | Slippage | Position Size | Max Exposure | Max Positions |
+|---|---|---|---|---|---|
+| Baseline | 0% | 0% | 100% | 100% | 10 |
+| Moderate | 0.05% | 0.02% | 10% | 50% | 3 |
+| Stress | 0.15% | 0.05% | 5% | 25% | 2 |
+
+**Rule:** Scenario definitions are frozen. No parameter adjustments after evaluation begins.
+
+---
+
+## 4. Evaluation Protocol (Locked Before Testing)
+
+| Protocol Element | Requirement |
+|---|---|
+| Metrics | Total return, net profit, win rate, profit factor, expectancy, max drawdown, avg win/loss, Sharpe, Sortino, exposure, trade count |
+| Cost assumptions | Gross and net reported separately; moderate scenario is the primary benchmark |
+| Missing data handling | Incomplete horizons are not losses; coverage and performance reported separately |
+| Reproducibility | Same dataset + same frozen config + same scenarios = identical results |
+| Reporting format | Per-timeframe, per-signal, per-symbol breakdown; gross vs. net comparison |
+
+---
+
+## 5. Strategy Integrity (Locked Before Testing)
+
+The frozen Phase 4 specification (`PHASE-4-STRATEGY-SPEC.md`) must be verified before each Phase 6 run:
+
+- `verifyFrozenSpec()` must return `true`
+- No changes to signal rules, entry conditions, or evaluation criteria permitted
+- E4 excluded; E3 deferred; E2 entry delay fixed at 300,000ms
+- Canonical symbol mapping enforced
+
+---
+
+## 6. Phase 6 Run Record
+
+Every Phase 6 evaluation must be recorded with:
+
+| Record Field | Description |
+|---|---|
+| Run ID | Unique identifier |
+| Timestamp | When evaluation started |
+| Dataset fingerprint | Checksum/version of `data/signals.duckdb` |
+| Frozen spec version | Reference to `PHASE-4-STRATEGY-SPEC.md` |
+| Risk scenarios used | Baseline, moderate, stress |
+| Date boundaries | Development, validation, test periods |
+| Symbol universe | Fixed list |
+| Results | Metrics per scenario |
+| Acceptance criteria met | Yes/No per criterion |
+| Conclusion | Whether strategy passes out-of-sample validation |
+
+**Rule:** All records preserved; no deletion or modification after results are visible.
+
+---
+
+## 7. Phase 6 Conclusion Criteria
+
+Before considering Phase 7 (Live Paper Trading), the strategy must demonstrate:
+
+1. Positive net results after moderate costs on untouched test data
+2. Acceptable drawdown (below predefined limit)
+3. Consistency across instruments and timeframes
+4. Stable behavior under stress scenario
+5. Reproducible results (same data = same output)
+6. All Phase 6 run records preserved and unmodified
+
+**Important:** A positive out-of-sample result does not guarantee future profitability. It only establishes that the strategy's historical edge is not purely an in-sample artifact.
+
+---
+
+## 8. Next Action
+
+Proceed to Phase 6 evaluation using the frozen dataset, frozen specification, predefined scenarios, and locked acceptance criteria. Do not adjust any parameter, threshold, or criterion after the first results are examined.
