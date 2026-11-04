@@ -319,7 +319,9 @@ export async function evaluateTimeframe(
     });
 
     // E2: transition plus the documented waiting period, entering at the first
-    // available price after the waiting period ends.
+    // available price after the waiting period ends. The entry time is the
+    // confirming candle's close so that the forward-return window starts strictly
+    // after the entry (consistent with E3 and the stated entry rule).
     const waitEnd = transition.observedAt + ENTRY_DELAY_MS;
     const candles = candlesByCanonical.get(canonicalSymbol) ?? [];
     const firstCandleAfterWait = candles.find((c) => c.closeTime > waitEnd);
@@ -329,7 +331,7 @@ export async function evaluateTimeframe(
       symbol: canonicalSymbol,
       signal,
       entryPrice,
-      entryTime: waitEnd,
+      entryTime: firstCandleAfterWait?.closeTime ?? Number.NaN,
     });
   }
 
