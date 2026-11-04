@@ -176,3 +176,24 @@ Proceed to Phase 5 (Build the First Paper Backtester) using this frozen specific
 ### 10.5 Next Action
 
 Execute E3 with the frozen threshold, preserve output/config, compare E1/E2/E3, decide E3 inclusion, then proceed to the next validation stage (paper backtester pending).
+
+---
+
+## 11. Research Finding — E2 Superiority Not Established (Corrected Comparison)
+
+**Date:** 2026-11-04  
+**Status:** Research finding applied to the E1/E2 comparison record.
+
+Following the corrected E1/E2 evaluation (E2 entry-time fix in `src/evaluation.ts`) and the fresh E1/E2/E3 comparison:
+
+- The corrected comparison does **not** establish that E2 demonstrated superiority over E1.
+- The frozen specification's rationale for selecting E2 ("Phase 1 statistical validation demonstrated E2's superiority") is not supported by the corrected aggregate comparison.
+- **E1 remains the baseline** entry method.
+- **E2 remains the comparator** entry method.
+- **E3 remains excluded** from the selected strategy, with its confirmation threshold frozen at `0.0001`.
+
+### 11.1 Versioned Change Record
+
+| Version | Date | Change |
+| ------- | ---- | ------ |
+| 1.2 | 2026-11-04 | Research finding added: corrected E1/E2 comparison does not establish E2 superiority over E1. E3 exclusion retained with frozen threshold. |
