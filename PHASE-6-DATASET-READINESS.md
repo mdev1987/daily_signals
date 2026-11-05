@@ -104,7 +104,21 @@ Compliance against the approved thresholds is pending the accumulation of suffic
 
 ---
 
-## 7. Next Actions and Decision Standing
+## 7. Audit Outcome Classification
+
+Every readiness audit must classify its result into exactly one of:
+
+| Outcome | Meaning |
+|---|---|
+| `NOT_READY` | Dataset requirements are not satisfied. Collection continues; no research or evaluation may proceed. |
+| `READY_FOR_STATISTICAL_RESEARCH` | Dataset requirements pass, but statistical adequacy is not established. |
+| `READY_FOR_PHASE_6` | Dataset and statistical requirements have both been satisfied, and the evaluation protocol is frozen. |
+
+**Rule:** A successful data audit is never by itself authorization to evaluate or deploy the strategy. Interpretation requires the subsequent statistical assessment.
+
+---
+
+## 8. Next Actions and Decision Standing
 
 1. Commit the clarified protocol — done (`20539f0`).
 2. Continue passive collection — active.
