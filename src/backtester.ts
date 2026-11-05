@@ -145,6 +145,164 @@ export interface BacktestResult {
 }
 
 /**
+ * Pure backtester helpers — extracted for independent validation via synthetic cases.
+ * These functions implement only the frozen execution rules; no strategy logic lives here.
+ */
+
+export interface BacktestCandleLike {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  closeTime: number;
+}
+
+export interface ExitSimulationInput {
+  openPositions: TradeRecord[];
+  candlesByCanonical: Map<string, BacktestCandleLike[]>;
+  config: StrategyConfig;
+  scenario: RiskScenario;
+}
+
+export interface ExitSimulationResult {
+  closedTrades: TradeRecord[];
+  openTrades: TradeRecord[];
+}
+
+/**
+ * Capital / exposure / simultaneous-position eligibility for a new entry.
+ * Mirrors the frozen entry guards (exposure limit + max simultaneous positions).
+ */
+export function canOpenPosition(
+  openPositions: TradeRecord[],
+  newEntryPrice: number,
+  balance: number,
+  scenario: RiskScenario,
+): boolean {
+  const currentExposure = openPositions.reduce((sum, p) => sum + p.entryPrice, 0);
+  const newExposure = currentExposure + newEntryPrice;
+  if (newExposure > balance * scenario.maxExposurePct / 100) return false;
+  if (openPositions.length >= scenario.maxSimultaneousPositions) return false;
+  return true;
+}
+
+/**
+ * Phase 5 exit simulation: close open positions by scanning forward candles
+ * from the entry and applying the first exit condition met (stop-loss, take-profit,
+ * trailing stop, time-based); then apply end-of-data mark-to-market liquidation
+ * for positions still open.
+ */
+export function simulateExits(input: ExitSimulationInput): ExitSimulationResult {
+  const { openPositions, candlesByCanonical, config, scenario } = input;
+  const openPositionsCopy = [...openPositions];
+  const closedTrades: TradeRecord[] = [];
+
+  for (const trade of openPositionsCopy) {
+    const candles = candlesByCanonical.get(trade.symbol) ?? [];
+    const isLong = trade.direction === "long";
+    const stopLossPct = scenario.stopLossPct;
+    const takeProfitPct = scenario.takeProfitPct;
+    const trailingStopPct = config.trailingStopPct ?? 0;
+    const maxHoldingPeriodMs = config.maxHoldingPeriodMs ?? 0;
+
+    let exit: { price: number; time: number; reason: TradeRecord["exitReason"] } | null = null;
+    let peak = trade.entryPrice;
+
+    for (const c of candles) {
+      if (c.closeTime <= trade.entryTime) continue;
+
+      if (isLong) {
+        peak = Math.max(peak, c.high);
+        if (stopLossPct > 0 && c.low <= trade.entryPrice * (1 - stopLossPct / 100)) {
+          exit = { price: trade.entryPrice * (1 - stopLossPct / 100), time: c.closeTime, reason: "stop" };
+          break;
+        }
+        if (takeProfitPct > 0 && c.high >= trade.entryPrice * (1 + takeProfitPct / 100)) {
+          exit = { price: trade.entryPrice * (1 + takeProfitPct / 100), time: c.closeTime, reason: "target" };
+          break;
+        }
+        if (trailingStopPct > 0 && c.low <= peak * (1 - trailingStopPct / 100)) {
+          exit = { price: peak * (1 - trailingStopPct / 100), time: c.closeTime, reason: "trailing" };
+          break;
+        }
+      } else {
+        peak = Math.min(peak, c.low);
+        if (stopLossPct > 0 && c.high >= trade.entryPrice * (1 + stopLossPct / 100)) {
+          exit = { price: trade.entryPrice * (1 + stopLossPct / 100), time: c.closeTime, reason: "stop" };
+          break;
+        }
+        if (takeProfitPct > 0 && c.low <= trade.entryPrice * (1 - takeProfitPct / 100)) {
+          exit = { price: trade.entryPrice * (1 - takeProfitPct / 100), time: c.closeTime, reason: "target" };
+          break;
+        }
+        if (trailingStopPct > 0 && c.high >= peak * (1 + trailingStopPct / 100)) {
+          exit = { price: peak * (1 + trailingStopPct / 100), time: c.closeTime, reason: "trailing" };
+          break;
+        }
+      }
+
+      if (maxHoldingPeriodMs > 0 && c.closeTime - trade.entryTime >= maxHoldingPeriodMs) {
+        exit = { price: c.close, time: c.closeTime, reason: "time" };
+        break;
+      }
+    }
+
+    if (exit) {
+      const dirMult = trade.direction === "long" ? 1 : -1;
+      const gross = (exit.price - trade.entryPrice) * dirMult;
+      const fees = Math.abs(trade.entryPrice) * scenario.transactionCostPct / 100;
+      const slippage = Math.abs(trade.entryPrice) * scenario.slippagePct;
+      trade.exitTime = exit.time;
+      trade.exitPrice = exit.price;
+      trade.exitReason = exit.reason;
+      trade.grossPnL = gross;
+      trade.netPnL = gross - fees - slippage;
+      trade.fees = fees;
+      trade.slippage = slippage;
+      trade.holdingPeriodMs = exit.time - trade.entryTime;
+      trade.status = "closed";
+      closedTrades.push(trade);
+    }
+  }
+
+  const openTrades: TradeRecord[] = [];
+  for (const trade of openPositions) {
+    if (trade.status !== "open") continue;
+
+    // Phase 5: end-of-data mark-to-market liquidation of open positions at the
+    // last observed candle close, for closed-trade accounting. This is evaluation
+    // accounting only (realized PnL at period end); it is not a change to the
+    // frozen exit rules (stop-loss / take-profit / trailing stop / time-based).
+    const candles = candlesByCanonical.get(trade.symbol) ?? [];
+    const last = [...candles].reverse().find((c) => c.closeTime > trade.entryTime);
+    if (!last) {
+      openTrades.push(trade);
+      continue;
+    }
+    const dirMult = trade.direction === "long" ? 1 : -1;
+    const gross = (last.close - trade.entryPrice) * dirMult;
+    const fees = Math.abs(trade.entryPrice) * scenario.transactionCostPct / 100;
+    const slippage = Math.abs(trade.entryPrice) * scenario.slippagePct;
+    trade.exitTime = last.closeTime;
+    trade.exitPrice = last.close;
+    trade.exitReason = "mark";
+    trade.grossPnL = gross;
+    trade.netPnL = gross - fees - slippage;
+    trade.fees = fees;
+    trade.slippage = slippage;
+    trade.holdingPeriodMs = last.closeTime - trade.entryTime;
+    trade.status = "closed";
+    closedTrades.push(trade);
+  }
+
+  for (const trade of openPositions) {
+    if (trade.status === "open") openTrades.push(trade);
+  }
+
+  return { closedTrades, openTrades };
+}
+
+/**
  * Main backtester — implements frozen Phase 4 E2 specification
  */
 export async function runBacktest(
@@ -190,17 +348,10 @@ export async function runBacktest(
     const entryTime = entryCandle.closeTime;
     const direction = trans.currentSignal === "BUY" || trans.currentSignal === "STRONG_BUY" ? "long" : "short";
     
-    // Check exposure limit
-    const currentExposure = openPositions.reduce((sum, p) => sum + p.entryPrice, 0);
-    const newExposure = currentExposure + entryPrice;
-    if (newExposure > balance * scenario.maxExposurePct / 100) {
+    // Check exposure and simultaneous-position limits (pure helper for validation)
+    if (!canOpenPosition(openPositions, entryPrice, balance, scenario)) {
       // Rejected entry — record but do not open
       continue;
-    }
-    
-    // Check max simultaneous positions
-    if (openPositions.length >= scenario.maxSimultaneousPositions) {
-      continue; // Rejected
     }
     
     // Create trade
@@ -225,103 +376,18 @@ export async function runBacktest(
     trades.push(trade);
   }
 
-    // Phase 5 exit simulation: close each open position by scanning forward
-  // candles from the entry and applying the first exit condition met
-  // (stop-loss, take-profit, trailing stop, time-based) per frozen rules.
-  const openPositionsCopy = [...openPositions];
-  const closedTrades: TradeRecord[] = [];
-
-  for (const trade of openPositionsCopy) {
-    const candles = candlesByCanonical.get(trade.symbol) ?? [];
-    const isLong = trade.direction === "long";
-    const stopLossPct = scenario.stopLossPct;
-    const takeProfitPct = scenario.takeProfitPct;
-    const trailingStopPct = config.trailingStopPct ?? 0;
-    const maxHoldingPeriodMs = config.maxHoldingPeriodMs ?? 0;
-
-    let exit: { price: number; time: number; reason: TradeRecord["exitReason"] } | null = null;
-    let peak = trade.entryPrice;
-
-    for (const c of candles) {
-      if (c.closeTime <= trade.entryTime) continue;
-
-      if (isLong) {
-        peak = Math.max(peak, c.high);
-        if (stopLossPct > 0 && c.low <= trade.entryPrice * (1 - stopLossPct / 100)) {
-          exit = { price: trade.entryPrice * (1 - stopLossPct / 100), time: c.closeTime, reason: "stop" };
-          break;
-        }
-        if (takeProfitPct > 0 && c.high >= trade.entryPrice * (1 + takeProfitPct / 100)) {
-          exit = { price: trade.entryPrice * (1 + takeProfitPct / 100), time: c.closeTime, reason: "target" };
-          break;
-        }
-        if (trailingStopPct > 0 && peak * (1 - trailingStopPct / 100) <= c.low) {
-          exit = { price: peak * (1 - trailingStopPct / 100), time: c.closeTime, reason: "trailing" };
-          break;
-        }
-      } else {
-        peak = Math.min(peak, c.low);
-        if (stopLossPct > 0 && c.high >= trade.entryPrice * (1 + stopLossPct / 100)) {
-          exit = { price: trade.entryPrice * (1 + stopLossPct / 100), time: c.closeTime, reason: "stop" };
-          break;
-        }
-        if (takeProfitPct > 0 && c.low <= trade.entryPrice * (1 - takeProfitPct / 100)) {
-          exit = { price: trade.entryPrice * (1 - takeProfitPct / 100), time: c.closeTime, reason: "target" };
-          break;
-        }
-        if (trailingStopPct > 0 && peak * (1 + trailingStopPct / 100) >= c.high) {
-          exit = { price: peak * (1 + trailingStopPct / 100), time: c.closeTime, reason: "trailing" };
-          break;
-        }
-      }
-
-      if (maxHoldingPeriodMs > 0 && c.closeTime - trade.entryTime >= maxHoldingPeriodMs) {
-        exit = { price: c.close, time: c.closeTime, reason: "time" };
-        break;
-      }
-    }
-
-    if (exit) {
-      const dirMult = trade.direction === "long" ? 1 : -1;
-      const gross = (exit.price - trade.entryPrice) * dirMult;
-      const fees = Math.abs(trade.entryPrice) * scenario.transactionCostPct / 100;
-      const slippage = Math.abs(trade.entryPrice) * scenario.slippagePct / 100;
-      trade.exitTime = exit.time;
-      trade.exitPrice = exit.price;
-      trade.exitReason = exit.reason;
-      trade.grossPnL = gross;
-      trade.netPnL = gross - fees - slippage;
-      trade.fees = fees;
-      trade.slippage = slippage;
-      trade.holdingPeriodMs = exit.time - trade.entryTime;
-      trade.status = "closed";
-      closedTrades.push(trade);
-    }
-  }
-
-  // Phase 5: end-of-data mark-to-market liquidation of open positions at the
-  // last observed candle close, for closed-trade accounting. This is evaluation
-  // accounting only (realized PnL at period end); it is not a change to the
-  // frozen exit rules (stop-loss / take-profit / trailing stop / time-based).
-  for (const trade of [...openPositions]) {
-    if (trade.status !== "open") continue;
-    const candles = candlesByCanonical.get(trade.symbol) ?? [];
-    const last = [...candles].reverse().find((c) => c.closeTime > trade.entryTime);
-    if (!last) continue;
-    const dirMult = trade.direction === "long" ? 1 : -1;
-    const gross = (last.close - trade.entryPrice) * dirMult;
-    const fees = Math.abs(trade.entryPrice) * scenario.transactionCostPct / 100;
-    const slippage = Math.abs(trade.entryPrice) * scenario.slippagePct / 100;
-    trade.exitTime = last.closeTime;
-    trade.exitPrice = last.close;
-    trade.exitReason = "mark";
-    trade.grossPnL = gross;
-    trade.netPnL = gross - fees - slippage;
-    trade.fees = fees;
-    trade.slippage = slippage;
-    trade.holdingPeriodMs = last.closeTime - trade.entryTime;
-    trade.status = "closed";
-  }
+    // Phase 5 exit simulation: close open positions by scanning forward candles
+    // from the entry and applying the first exit condition met (stop-loss, take-profit,
+    // trailing stop, time-based) per frozen rules; then end-of-data mark-to-market
+    // liquidation for positions still open.
+  const { openTrades: stillOpenTrades } = simulateExits({
+    openPositions,
+    candlesByCanonical,
+    config,
+    scenario,
+  });
+  openPositions.length = 0;
+  openPositions.push(...stillOpenTrades);
 
   const metrics = computeMetrics(trades, scenario);
   
@@ -334,7 +400,7 @@ export async function runBacktest(
   };
 }
 
-function computeMetrics(trades: TradeRecord[], scenario: RiskScenario): BacktestResult["metrics"] {
+export function computeMetrics(trades: TradeRecord[], scenario: RiskScenario): BacktestResult["metrics"] {
   const closed = trades.filter(t => t.status === "closed");
   const wins = closed.filter(t => t.grossPnL > 0);
   
@@ -347,6 +413,20 @@ function computeMetrics(trades: TradeRecord[], scenario: RiskScenario): Backtest
   
   const profitFactor = grossPnL > 0 ? grossPnL / Math.abs(closed.filter(t => t.grossPnL < 0).reduce((s, t) => s + t.grossPnL, 0)) : 0;
   const expectancy = closed.length > 0 ? grossPnL / closed.length : 0;
+
+  // Drawdown: peak-to-trough equity decline computed from the closed-trade
+  // equity curve (starting capital 10,000), processed chronologically by exit time.
+  const orderedClosed = [...closed].sort((a, b) => (a.exitTime ?? 0) - (b.exitTime ?? 0));
+  let equity = 10000;
+  let peakEquity = 10000;
+  let maxDrawdownCalc = 0;
+  for (const t of orderedClosed) {
+    equity += t.netPnL;
+    if (equity > peakEquity) peakEquity = equity;
+    const drawdown = peakEquity > 0 ? (peakEquity - equity) / peakEquity : 0;
+    if (drawdown > maxDrawdownCalc) maxDrawdownCalc = drawdown;
+  }
+  const maxDrawdown = maxDrawdownCalc;
   
   return {
     totalReturn: grossPnL / 10000,
@@ -354,7 +434,7 @@ function computeMetrics(trades: TradeRecord[], scenario: RiskScenario): Backtest
     winRate,
     profitFactor,
     expectancy,
-    maxDrawdown: 0, // To be computed from portfolio history
+    maxDrawdown,
     avgWin,
     avgLoss,
     sharpeRatio: 0, // To be computed from portfolio history
