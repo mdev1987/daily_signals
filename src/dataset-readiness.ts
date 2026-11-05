@@ -5,6 +5,14 @@
  * optimizing strategy performance. Intended for Phase 6 preparation: informs
  * whether additional data collection is needed before a new independent
  * out-of-sample run.
+ *
+ * Checks performed:
+ * - Dataset fingerprint and basic table counts
+ * - Candle coverage per timeframe
+ * - Signal coverage per timeframe
+ * - Signal-to-candle join coverage (signals with usable price data)
+ * - Per-symbol event distribution (concentration indicators)
+ * - Temporal continuity (max candle gap per symbol/timeframe)
  */
 
 import { createHash } from "node:crypto";
@@ -120,6 +128,54 @@ async function main(): Promise<void> {
   `);
   const signalRows = signalCoverage.getRowObjects() as Array<Record<string, unknown>>;
 
+  // Signal-to-candle join coverage: (timeframe, symbol) pairs that have both
+  // at least one signal and at least one usable candle.
+  const joinCoverage = await connection.runAndReadAll(`
+    SELECT
+      s.timeframe AS timeframe,
+      s.symbol AS symbol,
+      COUNT(*) AS n_signals,
+      COUNT(c.close) AS n_candles
+    FROM signals s
+    LEFT JOIN price_candles c
+      ON c.symbol = s.symbol AND c.timeframe = s.timeframe
+    GROUP BY s.timeframe, s.symbol
+    ORDER BY s.timeframe, s.symbol
+  `);
+  const joinRows = joinCoverage.getRowObjects() as Array<Record<string, unknown>>;
+
+  // Per-symbol event distribution from raw signal history.
+  const symbolEventDistribution = await connection.runAndReadAll(`
+    SELECT
+      symbol,
+      timeframe,
+      COUNT(*) AS events
+    FROM signal_history
+    GROUP BY symbol, timeframe
+    ORDER BY events DESC
+  `);
+  const symbolEventRows = symbolEventDistribution.getRowObjects() as Array<Record<string, unknown>>;
+
+  // Temporal continuity: max gap (ms) between consecutive candles per (symbol, timeframe).
+  const temporalGaps = await connection.runAndReadAll(`
+    SELECT
+      timeframe,
+      symbol,
+      COUNT(*) AS n_candles,
+      MAX(CASE WHEN next_open IS NULL THEN 0 ELSE next_open - open_time END) AS max_gap_ms
+    FROM (
+      SELECT
+        symbol,
+        timeframe,
+        open_time,
+        LEAD(open_time) OVER (PARTITION BY symbol, timeframe ORDER BY open_time) AS next_open
+      FROM price_candles
+    ) g
+    GROUP BY timeframe, symbol
+    ORDER BY timeframe, symbol
+  `);
+  const gapRows = temporalGaps.getRowObjects() as Array<Record<string, unknown>>;
+
   console.log("========================================");
   console.log("       DATASET READINESS REPORT (read-only)");
   console.log("========================================");
@@ -139,6 +195,24 @@ async function main(): Promise<void> {
   for (const row of signalRows) {
     console.log(
       `tf=${String(row.timeframe)} symbols=${toNumber(row.symbols_with_signals)} signals=${toNumber(row.signals)}`,
+    );
+  }
+  console.log("---- signal-to-candle join coverage (timeframe, symbol -> n_signals, n_candles) ----");
+  for (const row of joinRows) {
+    console.log(
+      `tf=${String(row.timeframe)} symbol=${String(row.symbol)} n_signals=${toNumber(row.n_signals)} n_candles=${toNumber(row.n_candles)}`,
+    );
+  }
+  console.log("---- per-symbol event distribution (top by events) ----");
+  for (const row of symbolEventRows.slice(0, 20)) {
+    console.log(
+      `symbol=${String(row.symbol)} tf=${String(row.timeframe)} events=${toNumber(row.events)}`,
+    );
+  }
+  console.log("---- temporal continuity (max gap ms per timeframe, symbol) ----");
+  for (const row of gapRows) {
+    console.log(
+      `tf=${String(row.timeframe)} symbol=${String(row.symbol)} n_candles=${toNumber(row.n_candles)} max_gap_ms=${toNumber(row.max_gap_ms)}`,
     );
   }
 
