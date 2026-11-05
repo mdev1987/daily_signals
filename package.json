@@ -22,7 +22,7 @@
     "@duckdb/node-api": "^2.0.0-r.1",
     "biquote": "^0.3.0",
     "cheerio": "^1.2.0",
-    "finnhub": "^2.0.15",
+    "finnhub": "^2.0.16",
     "grammy": "^1.46.0",
     "telegram-markdown-v2": "^0.0.5"
   }
