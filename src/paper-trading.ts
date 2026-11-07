@@ -2,24 +2,38 @@ import { withSerializedDatabaseOperation, type DatabaseConnection, type SignalCh
 import type { SignalType } from "./parser";
 import { resolveCanonicalSymbol } from "./alignment";
 import { telegram } from "./telegram";
+import {
+  PAPER_STARTING_BALANCE,
+  PAPER_TRADING_DURATION_MS,
+  PAPER_PRICE_TIMEFRAME,
+  PAPER_MAX_PRICE_AGE_MS,
+  PAPER_POSITION_SIZE_PCT,
+  PAPER_MAX_EXPOSURE_PCT,
+  PAPER_MAX_OPEN_POSITIONS,
+  PAPER_STOP_LOSS_PCT,
+  PAPER_TAKE_PROFIT_PCT,
+  PAPER_FEE_PCT_PER_SIDE,
+  PAPER_SLIPPAGE_PCT_PER_SIDE,
+  PAPER_ENTRY_CONFIRMATION_MS,
+} from "./config";
 
 /** Phase 7 operational rules: 1h/5h/1d are entry timeframes; 5m/15m/30m are monitors only. */
 export const PHASE7_CONFIG = {
-  startingBalance: Number(process.env.PAPER_STARTING_BALANCE ?? 10_000),
-  durationMs: 7 * 24 * 60 * 60 * 1_000,
+  startingBalance: PAPER_STARTING_BALANCE,
+  durationMs: PAPER_TRADING_DURATION_MS,
   primaryTimeframes: ["1h", "5h", "1d"] as const,
   monitorTimeframes: ["5m", "15m", "30m"] as const,
-  entryConfirmationMs: 5 * 60 * 1_000,
-  priceTimeframe: "5m",
-  maxPriceAgeMs: 15 * 60 * 1_000,
-  positionSizePct: 2,
-  maxExposurePct: 50,
-  maxOpenPositions: 3,
-  stopLossPct: 2,
-  takeProfitPct: 4,
-  feePctPerSide: 0.05,
-  slippagePctPerSide: 0.02,
-} as const;
+  entryConfirmationMs: PAPER_ENTRY_CONFIRMATION_MS,
+  priceTimeframe: PAPER_PRICE_TIMEFRAME,
+  maxPriceAgeMs: PAPER_MAX_PRICE_AGE_MS,
+  positionSizePct: PAPER_POSITION_SIZE_PCT,
+  maxExposurePct: PAPER_MAX_EXPOSURE_PCT,
+  maxOpenPositions: PAPER_MAX_OPEN_POSITIONS,
+  stopLossPct: PAPER_STOP_LOSS_PCT,
+  takeProfitPct: PAPER_TAKE_PROFIT_PCT,
+  feePctPerSide: PAPER_FEE_PCT_PER_SIDE,
+  slippagePctPerSide: PAPER_SLIPPAGE_PCT_PER_SIDE,
+};
 
 type Direction = "long" | "short";
 type DbRow = Record<string, unknown>;

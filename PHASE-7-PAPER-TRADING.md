@@ -23,9 +23,9 @@ These are an initial, predeclared test configuration, not optimized parameters:
 
 | Setting | Value |
 |---|---:|
-| Starting virtual balance | $10,000 (configurable) |
+| Starting virtual balance | $1,000 (configurable via `PAPER_STARTING_BALANCE`) |
 | Position size | 2% of current realized balance |
-| Maximum open positions | 3 |
+| Maximum open positions | 5 |
 | Maximum aggregate notional exposure | 50% of realized balance |
 | Stop-loss | 2% |
 | Take-profit | 4% |
@@ -51,7 +51,18 @@ The experiment start time is initialized once and persists across restarts. Rest
 Set (optional):
 
 ```env
-PAPER_STARTING_BALANCE=10000
+PAPER_STARTING_BALANCE=1000
+PAPER_TRADING_DURATION_MS=604800000
+PAPER_PRICE_TIMEFRAME=5m
+PAPER_MAX_PRICE_AGE_MS=900000
+PAPER_POSITION_SIZE_PCT=2
+PAPER_MAX_EXPOSURE_PCT=50
+PAPER_MAX_OPEN_POSITIONS=5
+PAPER_STOP_LOSS_PCT=2
+PAPER_TAKE_PROFIT_PCT=4
+PAPER_FEE_PCT_PER_SIDE=0.05
+PAPER_SLIPPAGE_PCT_PER_SIDE=0.02
+PAPER_ENTRY_CONFIRMATION_MS=300000
 ```
 
 Then run the normal receiver:
