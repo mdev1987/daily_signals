@@ -1,7 +1,7 @@
 export const BASE_URL = "https://massyart.com/ringsignal/inv";
 
-export const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 60_000);
-export const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS ?? 3_000);
+export const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 300_000);
+export const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS ?? 10_000);
 
 export const BIQUOTE_BASE_URL = "https://biquote.io/api";
 export const BIQUOTE_MAPPING_FILE =
