@@ -12,7 +12,7 @@ export const PHASE7_CONFIG = {
   entryConfirmationMs: 5 * 60 * 1_000,
   priceTimeframe: "5m",
   maxPriceAgeMs: 15 * 60 * 1_000,
-  positionSizePct: 10,
+  positionSizePct: 2,
   maxExposurePct: 50,
   maxOpenPositions: 3,
   stopLossPct: 2,

@@ -24,7 +24,7 @@ These are an initial, predeclared test configuration, not optimized parameters:
 | Setting | Value |
 |---|---:|
 | Starting virtual balance | $10,000 (configurable) |
-| Position size | 10% of current realized balance |
+| Position size | 2% of current realized balance |
 | Maximum open positions | 3 |
 | Maximum aggregate notional exposure | 50% of realized balance |
 | Stop-loss | 2% |
