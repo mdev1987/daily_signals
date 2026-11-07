@@ -198,7 +198,15 @@ async function runCycle(): Promise<void> {
   console.log(`\n[NEXT] Next cycle in ${(wait / 1000).toFixed(1)} seconds`);
 
   if (running) {
-    await Bun.sleep(wait);
+    // Abort-aware sleep: a SIGTERM/SIGINT must not wait out the full interval.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => resolve(), wait);
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      stopCollector.signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 }
 
@@ -241,6 +249,10 @@ async function main(): Promise<void> {
   }
 
   console.log("[ENGINE] Stopped.");
+
+  // Force exit: open handles (Tor client sockets, DuckDB, Telegram) can keep
+  // the Bun event loop alive after the async cleanup above completes.
+  process.exit(0);
 }
 
 await main();
