@@ -1,6 +1,7 @@
 import { withSerializedDatabaseOperation, type DatabaseConnection, type SignalChange } from "./database";
 import type { SignalType } from "./parser";
 import { resolveCanonicalSymbol } from "./alignment";
+import { telegram } from "./telegram";
 
 /** Phase 7 operational rules: 1h/5h/1d are entry timeframes; 5m/15m/30m are monitors only. */
 export const PHASE7_CONFIG = {
@@ -102,6 +103,22 @@ async function initializePaperTradingUnlocked(connection: DatabaseConnection): P
     )
   `);
 
+  await connection.run(`
+    CREATE TABLE IF NOT EXISTS phase7_reports (
+      id VARCHAR PRIMARY KEY,
+      report_type VARCHAR NOT NULL,
+      balance DOUBLE NOT NULL,
+      open_positions INTEGER NOT NULL,
+      closed_trades BIGINT NOT NULL,
+      net_pnl DOUBLE NOT NULL,
+      win_rate DOUBLE NOT NULL,
+      profit_factor DOUBLE NOT NULL,
+      max_open_positions INTEGER NOT NULL,
+      drawdown DOUBLE NOT NULL,
+      created_at BIGINT NOT NULL
+    )
+  `);
+
   const state = await rows(connection, "SELECT value FROM phase7_state WHERE key = 'started_at'");
   if (state.length === 0) {
     const now = Date.now();
@@ -171,7 +188,15 @@ async function closePosition(
   const entrySlippage = asNumber(position.entry_slippage);
   const fees = entryFee + exitFee;
   const slippage = entrySlippage + exitSlippage;
-  const net = gross - exitFee; // Entry slippage is already reflected in the effective entry price.
+  const net = gross - fees;
+
+  const reportMd =
+    `💥 **Phase 7 Paper Trading** — Position Closed\n\n` +
+    `🏷 **Symbol** · \`${String(position.symbol)}\`\n` +
+    `📈 **Direction** · \`${direction}\`\n` +
+    `🎯 **Exit** · \`${exitReason}\`\n` +
+    `💸 **Net PnL** · \`$${net.toFixed(2)}\``;
+  const reportSent = await telegram(reportMd);
 
   await connection.run("BEGIN TRANSACTION");
   try {
@@ -193,6 +218,9 @@ async function closePosition(
     throw error;
   }
   console.log(`[PAPER] CLOSE ${position.symbol} ${direction.toUpperCase()} | ${exitReason} | net $${(gross - fees).toFixed(2)}`);
+  if (!reportSent) {
+    console.log("[PAPER] Telegram close report failed.");
+  }
 }
 
 async function closeOnStops(connection: DatabaseConnection): Promise<void> {
@@ -329,6 +357,16 @@ async function processPendingEntries(connection: DatabaseConnection): Promise<vo
       throw error;
     }
     console.log(`[PAPER] OPEN ${symbol} ${direction.toUpperCase()} via ${timeframe} | entry ${entryPrice} | notional $${notional.toFixed(2)}`);
+    const openMd =
+      `🚀 **Phase 7 Paper Trading** — Position Opened\n\n` +
+      `🏷 **Symbol** · \`${symbol}\`\n` +
+      `📈 **Direction** · \`${direction}\`\n` +
+      `⏱ **Via** · \`${timeframe}\` · Entry $${entryPrice.toFixed(5)}\n\n` +
+      `_Paper session · Phase 7_`;
+    const openReportSent = await telegram(openMd);
+    if (!openReportSent) {
+      console.log("[PAPER] Telegram open report failed.");
+    }
   }
 }
 
@@ -377,7 +415,10 @@ async function dailyReport(connection: DatabaseConnection): Promise<void> {
     "INSERT INTO phase7_state (key, value, updated_at) VALUES (?, 'sent', ?)",
     [key, now],
   );
-  console.log(`[PAPER] DAILY ${day} | closed ${summary[0]!.trades} | winners ${summary[0]!.winners} | net $${asNumber(summary[0]!.net_pnl).toFixed(2)}`);
+  const reportSent = await sendPaperStatusReportUnlocked(connection);
+  console.log(
+    `[PAPER] DAILY ${day} | closed ${summary[0]!.trades} | winners ${summary[0]!.winners} | net $${asNumber(summary[0]!.net_pnl).toFixed(2)} | report_sent=${reportSent}`,
+  );
 }
 
 async function realizedMaxDrawdown(connection: DatabaseConnection): Promise<number> {
@@ -392,6 +433,90 @@ async function realizedMaxDrawdown(connection: DatabaseConnection): Promise<numb
     if (peak > 0) maxDrawdown = Math.max(maxDrawdown, (peak - equity) / peak * 100);
   }
   return maxDrawdown;
+}
+
+/**
+ * Phase 7 paper-trading performance report, delivered to Telegram in
+ * MarkdownV2 with icons. Covers balance, open positions, realized PnL,
+ * win rate, profit factor, exposure and drawdown.
+ */
+async function sendPaperStatusReportUnlocked(
+  connection: DatabaseConnection,
+): Promise<boolean> {
+  const startingBalance = await getStateNumber(connection, "starting_balance");
+  const closed = await rows(connection, "SELECT COALESCE(SUM(net_pnl), 0) AS pnl FROM paper_trades");
+  const open = await rows(connection, "SELECT * FROM paper_positions WHERE status = 'OPEN'");
+  const balance = startingBalance + asNumber(closed[0]?.pnl);
+  const pnlRows = await rows(connection, "SELECT net_pnl FROM paper_trades");
+
+  const winners = pnlRows.filter((row) => asNumber(row.net_pnl) > 0).length;
+  const losers = pnlRows.length - winners;
+  const netPnl = pnlRows.reduce((sum, row) => sum + asNumber(row.net_pnl), 0);
+  const winRate = pnlRows.length > 0 ? (winners / pnlRows.length) * 100 : 0;
+  const grossWins = pnlRows.reduce((sum, row) => sum + Math.max(0, asNumber(row.net_pnl)), 0);
+  const grossLosses = pnlRows.reduce((sum, row) => sum + Math.min(0, asNumber(row.net_pnl)), 0);
+  const profitFactor = grossLosses < 0 ? grossWins / Math.abs(grossLosses) : grossWins > 0 ? Number.POSITIVE_INFINITY : 0;
+  const drawdown = await realizedMaxDrawdown(connection);
+
+  const openLines: string[] = [];
+  for (const position of open) {
+    const direction = String(position.direction);
+    const entryPrice = asNumber(position.entry_price);
+    const notional = asNumber(position.notional);
+    const quantity = asNumber(position.quantity);
+    const dirMult = direction === "long" ? 1 : -1;
+    const quote = await latestPrice(connection, String(position.symbol));
+    const markPrice = quote?.price ?? entryPrice;
+    const unrealized = (markPrice - entryPrice) * quantity * dirMult;
+
+    openLines.push(
+      `• \`${String(position.symbol)}\` · \`${String(position.primary_timeframe)}\` · ${direction === "long" ? "📈 Long" : "📉 Short"} · Entry $${entryPrice.toFixed(5)} · Notional $${notional.toFixed(2)} · Unrealized $${unrealized.toFixed(2)}`,
+    );
+  }
+
+  const report =
+    `💼 **Phase 7 Paper Trading Report**\n\n` +
+    `🕒 **Time** · \`${new Date().toISOString()}\`\n` +
+    `💰 **Balance** · \`$${balance.toFixed(2)}\`\n` +
+    `📦 **Open Positions** · \`${open.length}\`\n` +
+    (openLines.length > 0 ? `${openLines.join("\n")}\n` : `No open positions.\n`) +
+    `📊 **Closed Trades** · \`${pnlRows.length}\` · 🏆 **Win Rate** · \`${winRate.toFixed(1)}%\`\n` +
+    `💹 **Net PnL** · \`$${netPnl.toFixed(2)}\` · 🎯 **Profit Factor** · \`${Number.isFinite(profitFactor) ? profitFactor.toFixed(2) : "∞"}\`\n` +
+    `🛡️ **Max Open Positions** · \`${Math.min(open.length, PHASE7_CONFIG.maxOpenPositions)}/${PHASE7_CONFIG.maxOpenPositions}\`\n` +
+    `🧊 **Realized Max Drawdown** · \`${drawdown.toFixed(2)}%\`\n\n` +
+    `_Automated by Daily Signals · Phase 7 Paper Trading_`;
+
+  const sent = await telegram(report);
+
+  const reportId = crypto.randomUUID();
+  await connection.run(
+    `INSERT INTO phase7_reports
+     (id, report_type, balance, open_positions, closed_trades, net_pnl, win_rate, profit_factor, max_open_positions, drawdown, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      reportId,
+      "status",
+      balance,
+      open.length,
+      pnlRows.length,
+      netPnl,
+      winRate,
+      Number.isFinite(profitFactor) ? profitFactor : 0,
+      Math.min(open.length, PHASE7_CONFIG.maxOpenPositions),
+      drawdown,
+      Date.now(),
+    ],
+  );
+
+  if (!sent) {
+    console.log("[PAPER] Telegram status report failed.");
+  }
+
+  return sent;
+}
+
+export function sendPaperStatusReport(connection: DatabaseConnection): Promise<boolean> {
+  return withSerializedDatabaseOperation(() => sendPaperStatusReportUnlocked(connection));
 }
 
 async function reportIfExpired(connection: DatabaseConnection): Promise<void> {

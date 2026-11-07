@@ -17,7 +17,7 @@ import {
   getExpectedSignalCount,
 } from "./database";
 import { runPriceCollector } from "./price-collector";
-import { notifySignalChanges, notifyStartup, telegram } from "./telegram";
+import { notifyStartup, telegram } from "./telegram";
 import { initializePaperTrading, runPaperTradingCycle, logPaperTradingStatus } from "./paper-trading";
 
 const connection = await openDatabase();
@@ -157,10 +157,9 @@ async function pollTimeframe(
       );
     }
 
-    if (result.changes.length > 0) {
-      // Notifications must never delay or break polling.
-      void notifySignalChanges(result.changes);
-    }
+    // Phase 7: signal/price change notifications are not sent. The paper
+    // trading engine owns Telegram reporting during the paper session and
+    // sends performance reports (balance, open positions, PnL, win rate).
 
     console.log(
       `[POLL] ${timeframe.name}: ${signals.length}/${expected || signals.length} signals` +
