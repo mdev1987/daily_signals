@@ -16,6 +16,10 @@ export type DatabaseConnection = Awaited<ReturnType<typeof openDatabase>>;
  */
 let writeChain: Promise<unknown> = Promise.resolve();
 
+export function withSerializedDatabaseOperation<T>(operation: () => Promise<T>): Promise<T> {
+  return serializedWrite(operation);
+}
+
 function serializedWrite<T>(operation: () => Promise<T>): Promise<T> {
   const result = writeChain.then(operation, operation);
 

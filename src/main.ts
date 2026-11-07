@@ -18,6 +18,7 @@ import {
 } from "./database";
 import { runPriceCollector } from "./price-collector";
 import { notifySignalChanges, notifyStartup, telegram } from "./telegram";
+import { initializePaperTrading, runPaperTradingCycle, logPaperTradingStatus } from "./paper-trading";
 
 const connection = await openDatabase();
 const stopCollector = new AbortController();
@@ -139,6 +140,11 @@ async function pollTimeframe(
     // Only valid polls reach the database.
     const result = await savePoll(connection, timeframe.name, signals);
 
+    // Paper trading consumes only primary-timeframe transitions. Lower timeframes
+    // are retained as monitoring context and never open or close positions.
+    await runPaperTradingCycle(connection, result.changes);
+    if (result.changes.length > 0) await logPaperTradingStatus(connection);
+
     // A successful poll resets the consecutive failure counter.
     pollGuardState.delete(timeframe.name);
 
@@ -208,6 +214,7 @@ async function main(): Promise<void> {
   console.log(` Price concurrency: ${PRICE_REQUEST_CONCURRENCY}`);
   console.log(` Telegram: ${TELEGRAM_ENABLED ? "enabled" : "disabled"}`);
   console.log(" Storage: DuckDB");
+  console.log(" Paper trading: Phase 7 (1h/5h/1d entries; 5m/15m/30m monitors)");
   console.log("==================================");
 
   void notifyStartup({
@@ -216,6 +223,8 @@ async function main(): Promise<void> {
     timeframes: TIMEFRAMES.length,
     databasePath: DATABASE_PATH,
   });
+
+  await initializePaperTrading(connection);
 
   // Runs independently from the signal cycle and writes through the same
   // serialized database queue.
