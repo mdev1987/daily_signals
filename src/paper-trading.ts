@@ -15,6 +15,7 @@ import {
   PAPER_FEE_PCT_PER_SIDE,
   PAPER_SLIPPAGE_PCT_PER_SIDE,
   PAPER_ENTRY_CONFIRMATION_MS,
+  timeframeToMs,
 } from "./config";
 
 /** Phase 7 operational rules: 1h/5h/1d are entry timeframes; 5m/15m/30m are monitors only. */
@@ -35,6 +36,35 @@ export const PHASE7_CONFIG = {
   slippagePctPerSide: PAPER_SLIPPAGE_PCT_PER_SIDE,
 };
 
+const PAPER_CANDLE_MS = timeframeToMs(PHASE7_CONFIG.priceTimeframe);
+
+function validatePhase7Config(): void {
+  const issues: string[] = [];
+  const requirePositive = (label: string, value: number) => {
+    if (!Number.isFinite(value) || value <= 0) issues.push(label);
+  };
+  const requireNonNegative = (label: string, value: number) => {
+    if (!Number.isFinite(value) || value < 0) issues.push(label);
+  };
+
+  requirePositive("startingBalance", PHASE7_CONFIG.startingBalance);
+  requirePositive("durationMs", PHASE7_CONFIG.durationMs);
+  requirePositive("entryConfirmationMs", PHASE7_CONFIG.entryConfirmationMs);
+  requirePositive("maxPriceAgeMs", PHASE7_CONFIG.maxPriceAgeMs);
+  requirePositive("positionSizePct", PHASE7_CONFIG.positionSizePct);
+  requirePositive("maxExposurePct", PHASE7_CONFIG.maxExposurePct);
+  requirePositive("maxOpenPositions", PHASE7_CONFIG.maxOpenPositions);
+  requirePositive("stopLossPct", PHASE7_CONFIG.stopLossPct);
+  requirePositive("takeProfitPct", PHASE7_CONFIG.takeProfitPct);
+  requireNonNegative("feePctPerSide", PHASE7_CONFIG.feePctPerSide);
+  requireNonNegative("slippagePctPerSide", PHASE7_CONFIG.slippagePctPerSide);
+  if (!Number.isFinite(PAPER_CANDLE_MS)) issues.push("priceTimeframe");
+
+  if (issues.length > 0) {
+    throw new Error(`Phase 7 paper trading configuration invalid: ${issues.join(", ")}`);
+  }
+}
+
 type Direction = "long" | "short";
 type DbRow = Record<string, unknown>;
 
@@ -54,6 +84,8 @@ async function rows(connection: DatabaseConnection, sql: string, params: any[] =
 }
 
 async function initializePaperTradingUnlocked(connection: DatabaseConnection): Promise<void> {
+  validatePhase7Config();
+
   if (!Number.isFinite(PHASE7_CONFIG.startingBalance) || PHASE7_CONFIG.startingBalance <= 0) {
     throw new Error("PAPER_STARTING_BALANCE must be a finite positive number");
   }
@@ -160,7 +192,7 @@ async function getStateNumber(connection: DatabaseConnection, key: string): Prom
 async function latestPrice(connection: DatabaseConnection, symbol: string): Promise<{ price: number; high: number; low: number; closeTime: number; canonicalSymbol: string } | null> {
   const canonicalSymbol = await resolveCanonicalSymbol(symbol);
   const result = await rows(connection, `
-    SELECT close, high, low, open_time + 300000 AS close_time
+    SELECT close, high, low, open_time + ${PAPER_CANDLE_MS} AS close_time
     FROM price_candles
     WHERE symbol = ? AND timeframe = ?
     ORDER BY open_time DESC LIMIT 1
@@ -243,9 +275,9 @@ async function closeOnStops(connection: DatabaseConnection): Promise<void> {
     const canonicalSymbol = await resolveCanonicalSymbol(String(position.symbol));
     const lastChecked = asNumber(position.last_checked_price_time);
     const candles = await rows(connection, `
-      SELECT open_time + 300000 AS close_time, high, low, close
+      SELECT open_time + ${PAPER_CANDLE_MS} AS close_time, high, low, close
       FROM price_candles
-      WHERE symbol = ? AND timeframe = ? AND open_time + 300000 > ?
+      WHERE symbol = ? AND timeframe = ? AND open_time + ${PAPER_CANDLE_MS} > ?
       ORDER BY open_time
     `, [canonicalSymbol, PHASE7_CONFIG.priceTimeframe, lastChecked]);
 
@@ -609,10 +641,12 @@ export function runPaperTradingCycle(
 async function logPaperTradingStatusUnlocked(connection: DatabaseConnection): Promise<void> {
   const { balance, open } = await portfolio(connection);
   const closed = await rows(connection, "SELECT COUNT(*) AS count, COALESCE(SUM(net_pnl), 0) AS pnl FROM paper_trades");
-  const monitorRows = await rows(connection, `
-    SELECT timeframe, COUNT(*) AS symbols FROM signals
-    WHERE timeframe IN ('5m', '15m', '30m') GROUP BY timeframe ORDER BY timeframe
-  `);
+  const monitorPlaceholders = PHASE7_CONFIG.monitorTimeframes.map(() => "?").join(", ");
+  const monitorRows = await rows(
+    connection,
+    `SELECT timeframe, COUNT(*) AS symbols FROM signals WHERE timeframe IN (${monitorPlaceholders}) GROUP BY timeframe ORDER BY timeframe`,
+    [...PHASE7_CONFIG.monitorTimeframes],
+  );
   const monitors = monitorRows.map((r) => `${r.timeframe}:${r.symbols}`).join(" ");
   console.log(`[PAPER] Balance $${balance.toFixed(2)} | open ${open.length} | closed ${closed[0]!.count} | realized PnL $${asNumber(closed[0]!.pnl).toFixed(2)} | monitors ${monitors || "not ready"}`);
 }

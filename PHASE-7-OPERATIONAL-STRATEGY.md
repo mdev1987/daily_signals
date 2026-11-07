@@ -2,7 +2,7 @@
 
 **Status:** Adopted — 2026-11-07 (from signal-usage guidance / screenshot)
 **Related documents:** `PHASE-4-STRATEGY-SPEC.md` (frozen — retained as historical research documentation), `PHASE-6-SAFEGUARDS.md` (frozen protocol), `PHASE-6-DATASET-READINESS.md` (frozen thresholds)
-**Stage:** Phase 7 (paper trading / operational reliability) — held pending Phase 6 formal out-of-sample evaluation and dataset readiness
+**Stage:** Phase 7 (paper trading / operational reliability) — **in progress** (paper session started 2026-11-07; launched without awaiting Phase 6 formal acceptance, per the adopted strategy)
 
 ---
 
@@ -103,6 +103,6 @@ The frozen Phase 4 strategy specification is **retained as historical research d
 1. Keep Phase 4 specification untouched (frozen).
 2. Keep Phase 6 safeguards untouched (frozen).
 3. Complete dataset readiness for a new Phase 6 evaluation (current extended dataset under review).
-4. Upon Phase 6 formal acceptance, execute Phase 7 paper trading under this operational strategy.
+4. Run the Phase 7 one-week paper trading session under this operational strategy (started 2026-11-07; Phase 6 formal acceptance was **not** required for launch).
 
-**Phase 7 remains held.**
+**Phase 7 is now executing.** At expiry: final liquidation of open positions with a fresh price, final performance report, then review before any real-money trading decision.

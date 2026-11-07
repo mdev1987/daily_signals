@@ -81,3 +81,12 @@ export const TIMEFRAMES = [
   { name: "1d", time: 86400 },
   { name: "1w", time: 604800 },
 ] as const;
+
+/** Resolve a timeframe name (e.g. "5m") to milliseconds. Returns NaN for unknown values. */
+export function timeframeToMs(timeframe: string): number {
+  const timeframeDef = (TIMEFRAMES as readonly { name: string; time: number }[]).find(
+    (tf) => tf.name === timeframe,
+  );
+  if (!timeframeDef) return Number.NaN;
+  return timeframeDef.time * 60_000;
+}
