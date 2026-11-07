@@ -13,9 +13,7 @@ export const PRICE_POLL_INTERVAL_MS = Number(
 export const PRICE_REQUEST_CONCURRENCY = Number(
   process.env.PRICE_REQUEST_CONCURRENCY ?? 4,
 );
-export const PRICE_CANDLE_LIMIT = Number(
-  process.env.PRICE_CANDLE_LIMIT ?? 100,
-);
+export const PRICE_CANDLE_LIMIT = Number(process.env.PRICE_CANDLE_LIMIT ?? 100);
 
 export const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN?.trim();
 export const TELEGRAM_CHAT_ID = process.env.CHAT_ID?.trim();
@@ -24,6 +22,8 @@ export const TELEGRAM_ENABLED =
   Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
 export const TELEGRAM_NOTIFY_STARTUP =
   process.env.TELEGRAM_NOTIFY_STARTUP !== "false";
+
+export const TOR_ENABLED = process.env.TOR_ENABLED !== "false";
 
 export const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID!;
 export const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY!;

@@ -24,6 +24,7 @@
     "cheerio": "^1.2.0",
     "finnhub": "^2.0.16",
     "grammy": "^1.46.0",
-    "telegram-markdown-v2": "^0.0.5"
+    "telegram-markdown-v2": "^0.0.5",
+    "tor-js": "^0.4.4"
   }
 }

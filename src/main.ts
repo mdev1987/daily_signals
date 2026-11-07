@@ -5,6 +5,7 @@ import {
   PRICE_POLL_INTERVAL_MS,
   PRICE_REQUEST_CONCURRENCY,
   TELEGRAM_ENABLED,
+  TOR_ENABLED,
 } from "./config";
 
 import { fetchSignalsPage } from "./fetcher";
@@ -16,11 +17,7 @@ import {
   getExpectedSignalCount,
 } from "./database";
 import { runPriceCollector } from "./price-collector";
-import {
-  notifySignalChanges,
-  notifyStartup,
-  telegram,
-} from "./telegram";
+import { notifySignalChanges, notifyStartup, telegram } from "./telegram";
 
 const connection = await openDatabase();
 const stopCollector = new AbortController();
@@ -133,8 +130,7 @@ async function pollTimeframe(
       if (signals.length < minimum) {
         rejectPoll(
           timeframe.name,
-          `Incomplete ${signals.length}/${expected} ` +
-            `(minimum ${minimum})`,
+          `Incomplete ${signals.length}/${expected} ` + `(minimum ${minimum})`,
         );
         return;
       }
@@ -204,6 +200,7 @@ async function runCycle(): Promise<void> {
 async function main(): Promise<void> {
   console.log("==================================");
   console.log(" Live Daily Signals Receiver");
+  console.log(`TOR ${TOR_ENABLED ? "enabled" : "disabled"}`);
   console.log(` Signal poll interval: ${POLL_INTERVAL_MS / 1000}s`);
   console.log(` Request delay: ${REQUEST_DELAY_MS}ms`);
   console.log(` Timeframes: ${TIMEFRAMES.length}`);
