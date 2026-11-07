@@ -1,5 +1,5 @@
 import { BASE_URL, TOR_ENABLED } from "./config";
-import { TorClient } from "tor-js";
+import { TorClient, storage } from "tor-js";
 
 const REQUEST_TIMEOUT = 15_000;
 
@@ -10,7 +10,11 @@ const HEADERS: Record<string, string> = {
   "Cache-Control": "no-cache",
 };
 
-const torClient = TOR_ENABLED ? new TorClient({}) : null;
+const torClient = TOR_ENABLED
+  ? new TorClient({
+      storage: new storage.MemoryStorage(),
+    })
+  : null;
 
 /**
  * Fetches the signals page for a given timestamp.
