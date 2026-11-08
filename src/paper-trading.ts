@@ -337,21 +337,42 @@ async function processPendingEntries(connection: DatabaseConnection): Promise<vo
     const direction = String(item.direction) as Direction;
     const signal = String(item.signal) as SignalType;
     const since = asNumber(item.signal_since);
-    if (Date.now() - since < PHASE7_CONFIG.entryConfirmationMs) continue;
+    const confirmationElapsedMs = Date.now() - since;
+    if (confirmationElapsedMs < PHASE7_CONFIG.entryConfirmationMs) {
+      console.log(
+        `[PAPER] PENDING WAIT ${symbol} ${timeframe} ${direction.toUpperCase()} | ` +
+        `confirmation ${Math.max(0, confirmationElapsedMs)}ms/${PHASE7_CONFIG.entryConfirmationMs}ms`,
+      );
+      continue;
+    }
 
     const current = await rows(connection,
       "SELECT signal FROM signals WHERE symbol = ? AND timeframe = ?", [symbol, timeframe]);
     if (!current.length || current[0]!.signal !== signal) {
+      const currentSignal = current.length ? String(current[0]!.signal) : "MISSING";
+      console.log(
+        `[PAPER] PENDING REJECT ${symbol} ${timeframe} | signal changed ` +
+        `${signal} -> ${currentSignal}`,
+      );
       await connection.run("DELETE FROM paper_pending_entries WHERE symbol = ? AND primary_timeframe = ?", [symbol, timeframe]);
       continue;
     }
 
     const quote = await latestPrice(connection, symbol);
-    if (!quote) continue;
+    if (!quote) {
+      console.warn(
+        `[PAPER] PENDING WAIT ${symbol} ${timeframe} | no valid fresh ` +
+        `${PHASE7_CONFIG.priceTimeframe} quote (symbol mapping, candle availability, or candle freshness)`,
+      );
+      continue;
+    }
     // Portfolio accounting is denominated in USD. Until FX conversion and CFD
     // contract multipliers are implemented, trade only USD-quoted instruments.
     if (!quote.canonicalSymbol.toUpperCase().endsWith("USD")) {
-      console.warn(`[PAPER] SKIP ${symbol}: ${quote.canonicalSymbol} is not USD-quoted; portfolio conversion is not implemented.`);
+      console.warn(
+        `[PAPER] PENDING REJECT ${symbol} ${timeframe} | ${quote.canonicalSymbol} ` +
+        `is not USD-quoted; portfolio conversion is not implemented`,
+      );
       await connection.run("DELETE FROM paper_pending_entries WHERE symbol = ? AND primary_timeframe = ?", [symbol, timeframe]);
       continue;
     }
@@ -360,18 +381,37 @@ async function processPendingEntries(connection: DatabaseConnection): Promise<vo
     const existingSymbolPosition = open.find((p) => String(p.symbol) === symbol);
     if (existingSymbolPosition) {
       if (String(existingSymbolPosition.direction) === direction) {
+        console.log(
+          `[PAPER] PENDING REJECT ${symbol} ${timeframe} | same-direction position already open`,
+        );
         await connection.run("DELETE FROM paper_pending_entries WHERE symbol = ? AND primary_timeframe = ?", [symbol, timeframe]);
+      } else {
+        console.log(
+          `[PAPER] PENDING WAIT ${symbol} ${timeframe} | opposite position still open; waiting for reversal exit`,
+        );
       }
       // If the existing position is opposite, retain this pending entry until
       // the reversal exit can be completed with a fresh price.
       continue;
     }
-    if (open.length >= PHASE7_CONFIG.maxOpenPositions) continue;
+    if (open.length >= PHASE7_CONFIG.maxOpenPositions) {
+      console.log(
+        `[PAPER] PENDING WAIT ${symbol} ${timeframe} | open-position limit ` +
+        `${open.length}/${PHASE7_CONFIG.maxOpenPositions}`,
+      );
+      continue;
+    }
 
     const currentExposure = open.reduce((sum, p) => sum + asNumber(p.notional), 0);
     const notional = Math.min(balance * PHASE7_CONFIG.positionSizePct / 100,
       balance * PHASE7_CONFIG.maxExposurePct / 100 - currentExposure);
-    if (!(notional > 0)) continue;
+    if (!(notional > 0)) {
+      console.log(
+        `[PAPER] PENDING WAIT ${symbol} ${timeframe} | no available exposure capacity ` +
+        `(balance $${balance.toFixed(2)}, current exposure $${currentExposure.toFixed(2)})`,
+      );
+      continue;
+    }
 
     const entryPrice = quote.price * (direction === "long"
       ? 1 + PHASE7_CONFIG.slippagePctPerSide / 100

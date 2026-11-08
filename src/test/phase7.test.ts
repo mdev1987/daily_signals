@@ -1,7 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { PHASE7_CONFIG, signalDirection } from "../paper-trading";
+import { timeframeToMs } from "../config";
 
 describe("Phase 7 operational strategy", () => {
+  test("converts configured timeframes from seconds to milliseconds", () => {
+    expect(timeframeToMs("5m")).toBe(300_000);
+    expect(timeframeToMs("15m")).toBe(900_000);
+    expect(timeframeToMs("1h")).toBe(3_600_000);
+    expect(timeframeToMs("5h")).toBe(18_000_000);
+    expect(timeframeToMs("1d")).toBe(86_400_000);
+    expect(timeframeToMs("unknown")).toBeNaN();
+  });
+
   test("uses 1h, 5h, and 1d as primary entry timeframes", () => {
     expect(PHASE7_CONFIG.primaryTimeframes).toEqual(["1h", "5h", "1d"]);
   });

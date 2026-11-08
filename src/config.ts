@@ -88,5 +88,6 @@ export function timeframeToMs(timeframe: string): number {
     (tf) => tf.name === timeframe,
   );
   if (!timeframeDef) return Number.NaN;
-  return timeframeDef.time * 60_000;
+  // TIMEFRAMES[].time is already expressed in seconds (e.g. 300 for 5m).
+  return timeframeDef.time * 1_000;
 }
