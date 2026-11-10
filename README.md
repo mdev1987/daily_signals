@@ -102,5 +102,4 @@ recalculated performance, price freshness, poll state, position/trade
 consistency checks, and stored-report reconciliation. It does not reset or
 modify the database.
 
-
 Phase 7 operational strategy, one-week paper-trading implementation, and rewrite notes live in [PHASE-7-PAPER-TRADING.md](./PHASE-7-PAPER-TRADING.md).
