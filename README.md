@@ -77,11 +77,6 @@ PRICE_CANDLE_LIMIT=100
 
 `DATABASE_PATH` can override the default `./data/signals.duckdb` location.
 
-
-## Phase 7 — One-Week Paper Trading
-
-See [PHASE-7-PAPER-TRADING.md](./PHASE-7-PAPER-TRADING.md) for the operational strategy, risk settings, database tables, and review queries. The normal `bun run start` command initializes the paper engine automatically. It uses simulated funds only and never submits broker orders.
-
 ## Phase 7 deep audit (read-only)
 
 Run this on the VPS against the same DuckDB file used by the service:
@@ -107,3 +102,5 @@ recalculated performance, price freshness, poll state, position/trade
 consistency checks, and stored-report reconciliation. It does not reset or
 modify the database.
 
+
+Phase 7 operational strategy, one-week paper-trading implementation, and rewrite notes live in [PHASE-7-PAPER-TRADING.md](./PHASE-7-PAPER-TRADING.md).
