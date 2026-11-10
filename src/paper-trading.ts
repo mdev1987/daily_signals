@@ -54,6 +54,18 @@ function validatePhase7Config(): void {
   requirePositive("positionSizePct", PHASE7_CONFIG.positionSizePct);
   requirePositive("maxExposurePct", PHASE7_CONFIG.maxExposurePct);
   requirePositive("maxOpenPositions", PHASE7_CONFIG.maxOpenPositions);
+  if (!Number.isInteger(PHASE7_CONFIG.maxOpenPositions)) {
+    issues.push("maxOpenPositions must be an integer");
+  }
+  if (PHASE7_CONFIG.positionSizePct > 100) {
+    issues.push("positionSizePct must be <= 100");
+  }
+  if (PHASE7_CONFIG.maxExposurePct > 100) {
+    issues.push("maxExposurePct must be <= 100");
+  }
+  if (PHASE7_CONFIG.priceTimeframe !== "5m") {
+    issues.push("priceTimeframe must remain 5m for Phase 7");
+  }
   requirePositive("stopLossPct", PHASE7_CONFIG.stopLossPct);
   requirePositive("takeProfitPct", PHASE7_CONFIG.takeProfitPct);
   requireNonNegative("feePctPerSide", PHASE7_CONFIG.feePctPerSide);
@@ -72,6 +84,15 @@ export function signalDirection(signal: string): Direction | null {
   if (signal === "BUY" || signal === "STRONG_BUY") return "long";
   if (signal === "SELL" || signal === "STRONG_SELL") return "short";
   return null;
+}
+
+/** True only for an explicit directional reversal; NEUTRAL/missing are not exits. */
+export function isDirectionalReversal(
+  currentSignal: string,
+  positionDirection: Direction,
+): boolean {
+  const currentDirection = signalDirection(currentSignal);
+  return currentDirection !== null && currentDirection !== positionDirection;
 }
 
 function asNumber(value: unknown): number {
@@ -189,6 +210,27 @@ async function getStateNumber(connection: DatabaseConnection, key: string): Prom
   return result.length ? Number(result[0]!.value) : 0;
 }
 
+async function isPhase7Completed(connection: DatabaseConnection): Promise<boolean> {
+  const result = await rows(
+    connection,
+    "SELECT value FROM phase7_state WHERE key = 'completed_at'",
+  );
+  return result.length > 0;
+}
+
+async function notifyTelegramSafely(message: string, context: string): Promise<void> {
+  try {
+    const sent = await telegram(message);
+    if (!sent) console.warn(`[PAPER] Telegram ${context} report failed.`);
+  } catch (error) {
+    console.warn(
+      `[PAPER] Telegram ${context} report error: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
 async function latestPrice(connection: DatabaseConnection, symbol: string): Promise<{ price: number; high: number; low: number; closeTime: number; canonicalSymbol: string } | null> {
   const canonicalSymbol = await resolveCanonicalSymbol(symbol);
   const result = await rows(connection, `
@@ -220,15 +262,25 @@ async function closePosition(
 ): Promise<void> {
   const direction = String(position.direction) as Direction;
   const entryPrice = asNumber(position.entry_price);
-  const notional = asNumber(position.notional);
   const quantity = asNumber(position.quantity);
   const entryTime = asNumber(position.entry_time);
   const exitTime = Date.now();
+
+  if (
+    !Number.isFinite(marketPrice) ||
+    marketPrice <= 0 ||
+    !Number.isFinite(quantity) ||
+    quantity <= 0
+  ) {
+    throw new Error(`Invalid close inputs for position ${String(position.id)}`);
+  }
+
   const adverseExit = marketPrice * (direction === "long"
     ? 1 - PHASE7_CONFIG.slippagePctPerSide / 100
     : 1 + PHASE7_CONFIG.slippagePctPerSide / 100);
   const gross = (adverseExit - entryPrice) * quantity * (direction === "long" ? 1 : -1);
-  const exitFee = notional * PHASE7_CONFIG.feePctPerSide / 100;
+  const exitNotional = quantity * adverseExit;
+  const exitFee = exitNotional * PHASE7_CONFIG.feePctPerSide / 100;
   const exitSlippage = Math.abs(marketPrice - adverseExit) * quantity;
   const entryFee = asNumber(position.entry_fee);
   const entrySlippage = asNumber(position.entry_slippage);
@@ -236,96 +288,139 @@ async function closePosition(
   const slippage = entrySlippage + exitSlippage;
   const net = gross - fees;
 
+  // Persist the trade before attempting any external notification. A Telegram
+  // outage must never leave a position open after its exit was calculated.
+  await connection.run("BEGIN TRANSACTION");
+  try {
+    const stillOpen = await rows(
+      connection,
+      "SELECT id FROM paper_positions WHERE id = ? AND status = 'OPEN'",
+      [String(position.id)],
+    );
+
+    if (stillOpen.length === 0) {
+      await connection.run("ROLLBACK");
+      return;
+    }
+
+    await connection.run(
+      `INSERT INTO paper_trades
+       (id, symbol, primary_timeframe, direction, signal, entry_time, entry_price,
+        exit_time, exit_price, notional, quantity, gross_pnl, fees, slippage,
+        net_pnl, exit_reason, holding_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        String(position.id), String(position.symbol), String(position.primary_timeframe),
+        direction, String(position.signal), entryTime, entryPrice, exitTime, adverseExit,
+        asNumber(position.notional), quantity, gross, fees, slippage, net,
+        exitReason, exitTime - entryTime,
+      ],
+    );
+    await connection.run(
+      "UPDATE paper_positions SET status = 'CLOSED' WHERE id = ? AND status = 'OPEN'",
+      [String(position.id)],
+    );
+    await connection.run("COMMIT");
+  } catch (error) {
+    await connection.run("ROLLBACK");
+    throw error;
+  }
+
+  console.log(
+    `[PAPER] CLOSE ${position.symbol} ${direction.toUpperCase()} | ${exitReason} | net $${net.toFixed(2)}`,
+  );
+
   const reportMd =
     `💥 **Phase 7 Paper Trading** — Position Closed\n\n` +
     `🏷 **Symbol** · \`${String(position.symbol)}\`\n` +
     `📈 **Direction** · \`${direction}\`\n` +
     `🎯 **Exit** · \`${exitReason}\`\n` +
     `💸 **Net PnL** · \`$${net.toFixed(2)}\``;
-  const reportSent = await telegram(reportMd);
-
-  await connection.run("BEGIN TRANSACTION");
-  try {
-    await connection.run(`
-      INSERT INTO paper_trades
-      (id, symbol, primary_timeframe, direction, signal, entry_time, entry_price,
-       exit_time, exit_price, notional, quantity, gross_pnl, fees, slippage,
-       net_pnl, exit_reason, holding_ms)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      String(position.id), String(position.symbol), String(position.primary_timeframe),
-      direction, String(position.signal), entryTime, entryPrice, exitTime, adverseExit,
-      notional, quantity, gross, fees, slippage, gross - fees, exitReason, exitTime - entryTime,
-    ]);
-    await connection.run("UPDATE paper_positions SET status = 'CLOSED' WHERE id = ?", [String(position.id)]);
-    await connection.run("COMMIT");
-  } catch (error) {
-    await connection.run("ROLLBACK");
-    throw error;
-  }
-  console.log(`[PAPER] CLOSE ${position.symbol} ${direction.toUpperCase()} | ${exitReason} | net $${(gross - fees).toFixed(2)}`);
-  if (!reportSent) {
-    console.log("[PAPER] Telegram close report failed.");
-  }
+  await notifyTelegramSafely(reportMd, "close");
 }
 
-async function closeOnStops(connection: DatabaseConnection): Promise<void> {
+async function closeOnStops(
+  connection: DatabaseConnection,
+  cutoffTime = Date.now(),
+): Promise<void> {
   const open = await rows(connection, "SELECT * FROM paper_positions WHERE status = 'OPEN'");
+
   for (const position of open) {
     const canonicalSymbol = await resolveCanonicalSymbol(String(position.symbol));
     const lastChecked = asNumber(position.last_checked_price_time);
     const candles = await rows(connection, `
-      SELECT open_time + ${PAPER_CANDLE_MS} AS close_time, high, low, close
+      SELECT
+        open_time + ${PAPER_CANDLE_MS} AS close_time,
+        high,
+        low,
+        close
       FROM price_candles
-      WHERE symbol = ? AND timeframe = ? AND open_time + ${PAPER_CANDLE_MS} > ?
-      ORDER BY open_time
-    `, [canonicalSymbol, PHASE7_CONFIG.priceTimeframe, lastChecked]);
+      WHERE symbol = ?
+        AND timeframe = ?
+        AND open_time + ${PAPER_CANDLE_MS} > ?
+        AND open_time + ${PAPER_CANDLE_MS} <= ?
+      ORDER BY open_time ASC
+    `, [canonicalSymbol, PHASE7_CONFIG.priceTimeframe, lastChecked, cutoffTime]);
 
     const direction = String(position.direction);
     const stop = asNumber(position.stop_price);
     const target = asNumber(position.target_price);
-    let closed = false;
+
     for (const candle of candles) {
       const high = asNumber(candle.high);
       const low = asNumber(candle.low);
       const closeTime = asNumber(candle.close_time);
-      // Use closed-candle high/low; if both levels were touched, assume stop first.
+
+      // Conservative OHLC assumption: if both barriers were touched in one
+      // candle, count the stop first because intrabar order is unknown.
       if (direction === "long" && low <= stop) {
         await closePosition(connection, position, stop, "STOP_LOSS");
-        closed = true;
-        break;
-      } else if (direction === "long" && high >= target) {
-        await closePosition(connection, position, target, "TAKE_PROFIT");
-        closed = true;
-        break;
-      } else if (direction === "short" && high >= stop) {
-        await closePosition(connection, position, stop, "STOP_LOSS");
-        closed = true;
-        break;
-      } else if (direction === "short" && low <= target) {
-        await closePosition(connection, position, target, "TAKE_PROFIT");
-        closed = true;
         break;
       }
+      if (direction === "long" && high >= target) {
+        await closePosition(connection, position, target, "TAKE_PROFIT");
+        break;
+      }
+      if (direction === "short" && high >= stop) {
+        await closePosition(connection, position, stop, "STOP_LOSS");
+        break;
+      }
+      if (direction === "short" && low <= target) {
+        await closePosition(connection, position, target, "TAKE_PROFIT");
+        break;
+      }
+
       await connection.run(
-        "UPDATE paper_positions SET last_checked_price_time = ? WHERE id = ?",
+        "UPDATE paper_positions SET last_checked_price_time = ? WHERE id = ? AND status = 'OPEN'",
         [closeTime, String(position.id)],
       );
     }
-    if (closed) continue;
   }
 }
 
 async function closeOnPrimaryReversals(connection: DatabaseConnection): Promise<void> {
   const open = await rows(connection, "SELECT * FROM paper_positions WHERE status = 'OPEN'");
+
   for (const position of open) {
-    const current = await rows(connection,
+    const current = await rows(
+      connection,
       "SELECT signal FROM signals WHERE symbol = ? AND timeframe = ?",
-      [String(position.symbol), String(position.primary_timeframe)]);
-    const currentDirection = current.length ? signalDirection(String(current[0]!.signal)) : null;
-    if (currentDirection === String(position.direction)) continue;
+      [String(position.symbol), String(position.primary_timeframe)],
+    );
+
+    // NEUTRAL or missing data is not a directional reversal. Only an explicit
+    // opposite BUY/SELL direction can close the position.
+    if (!current.length) continue;
+
+    if (!isDirectionalReversal(
+      String(current[0]!.signal),
+      String(position.direction) as Direction,
+    )) continue;
+
     const quote = await latestPrice(connection, String(position.symbol));
-    if (quote) await closePosition(connection, position, quote.price, "PRIMARY_SIGNAL_REVERSAL");
+    if (quote) {
+      await closePosition(connection, position, quote.price, "PRIMARY_SIGNAL_REVERSAL");
+    }
   }
 }
 
@@ -449,10 +544,7 @@ async function processPendingEntries(connection: DatabaseConnection): Promise<vo
       `📈 **Direction** · \`${direction}\`\n` +
       `⏱ **Via** · \`${timeframe}\` · Entry $${entryPrice.toFixed(5)}\n\n` +
       `_Paper session · Phase 7_`;
-    const openReportSent = await telegram(openMd);
-    if (!openReportSent) {
-      console.log("[PAPER] Telegram open report failed.");
-    }
+    await notifyTelegramSafely(openMd, "open");
   }
 }
 
@@ -486,8 +578,17 @@ async function processPrimaryChange(connection: DatabaseConnection, change: Sign
 async function dailyReport(connection: DatabaseConnection): Promise<void> {
   const day = new Date().toISOString().slice(0, 10);
   const key = `daily_report_${day}`;
-  const sent = await rows(connection, "SELECT value FROM phase7_state WHERE key = ?", [key]);
-  if (sent.length) return;
+  const sent = await rows(
+    connection,
+    "SELECT value, updated_at FROM phase7_state WHERE key = ?",
+    [key],
+  );
+  if (sent.length) {
+    const lastAttempt = asNumber(sent[0]!.updated_at);
+    const alreadySent = String(sent[0]!.value) === "sent";
+    const retryWindowElapsed = Date.now() - lastAttempt >= 60 * 60 * 1_000;
+    if (alreadySent || !retryWindowElapsed) return;
+  }
 
   const midnight = new Date(`${day}T00:00:00.000Z`).getTime();
   const summary = await rows(connection, `
@@ -496,12 +597,15 @@ async function dailyReport(connection: DatabaseConnection): Promise<void> {
       COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS winners
     FROM paper_trades WHERE exit_time >= ?
   `, [midnight]);
+  const reportSent = await sendPaperStatusReportUnlocked(connection);
   const now = Date.now();
   await connection.run(
-    "INSERT INTO phase7_state (key, value, updated_at) VALUES (?, 'sent', ?)",
-    [key, now],
+    `INSERT INTO phase7_state (key, value, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [key, reportSent ? "sent" : "failed", now],
   );
-  const reportSent = await sendPaperStatusReportUnlocked(connection);
   console.log(
     `[PAPER] DAILY ${day} | closed ${summary[0]!.trades} | winners ${summary[0]!.winners} | net $${asNumber(summary[0]!.net_pnl).toFixed(2)} | report_sent=${reportSent}`,
   );
@@ -552,11 +656,12 @@ async function sendPaperStatusReportUnlocked(
     const quantity = asNumber(position.quantity);
     const dirMult = direction === "long" ? 1 : -1;
     const quote = await latestPrice(connection, String(position.symbol));
-    const markPrice = quote?.price ?? entryPrice;
-    const unrealized = (markPrice - entryPrice) * quantity * dirMult;
+    const unrealized = quote
+      ? (quote.price - entryPrice) * quantity * dirMult
+      : null;
 
     openLines.push(
-      `• \`${String(position.symbol)}\` · \`${String(position.primary_timeframe)}\` · ${direction === "long" ? "📈 Long" : "📉 Short"} · Entry $${entryPrice.toFixed(5)} · Notional $${notional.toFixed(2)} · Unrealized $${unrealized.toFixed(2)}`,
+      `• \`${String(position.symbol)}\` · \`${String(position.primary_timeframe)}\` · ${direction === "long" ? "📈 Long" : "📉 Short"} · Entry $${entryPrice.toFixed(5)} · Notional $${notional.toFixed(2)} · Unrealized ${unrealized === null ? "unavailable (no fresh quote)" : `$${unrealized.toFixed(2)}`}`,
     );
   }
 
@@ -572,7 +677,16 @@ async function sendPaperStatusReportUnlocked(
     `🧊 **Realized Max Drawdown** · \`${drawdown.toFixed(2)}%\`\n\n` +
     `_Automated by Daily Signals · Phase 7 Paper Trading_`;
 
-  const sent = await telegram(report);
+  let sent = false;
+  try {
+    sent = await telegram(report);
+  } catch (error) {
+    console.warn(
+      `[PAPER] Telegram status report error: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 
   const reportId = crypto.randomUUID();
   await connection.run(
@@ -606,13 +720,14 @@ export function sendPaperStatusReport(connection: DatabaseConnection): Promise<b
 }
 
 async function reportIfExpired(connection: DatabaseConnection): Promise<void> {
+  if (await isPhase7Completed(connection)) return;
   const startedAt = await getStateNumber(connection, "started_at");
-  if (Date.now() < startedAt + PHASE7_CONFIG.durationMs) return;
-  const completed = await rows(connection, "SELECT value FROM phase7_state WHERE key = 'completed_at'");
-  if (completed.length) return;
+  if (!startedAt || Date.now() < startedAt + PHASE7_CONFIG.durationMs) return;
 
-  // Liquidate remaining positions at the latest fresh 5m close so the one-week
-  // report has a closed-trade result. Missing/stale prices remain explicitly open.
+  // First process all closed 5m candles that belong to the experiment window.
+  // Then liquidate any remaining positions at the latest fresh quote available
+  // when the final audit runs. Missing/stale prices remain explicitly open.
+  await closeOnStops(connection, startedAt + PHASE7_CONFIG.durationMs);
   const stillOpen = await rows(connection, "SELECT * FROM paper_positions WHERE status = 'OPEN'");
   for (const position of stillOpen) {
     const quote = await latestPrice(connection, String(position.symbol));
@@ -633,7 +748,14 @@ async function reportIfExpired(connection: DatabaseConnection): Promise<void> {
   const profitFactor = grossLosses < 0 ? grossWins / Math.abs(grossLosses) : grossWins > 0 ? Number.POSITIVE_INFINITY : 0;
   await connection.run("DELETE FROM paper_pending_entries");
   const now = Date.now();
-  await connection.run("INSERT INTO phase7_state (key, value, updated_at) VALUES ('completed_at', ?, ?)", [String(now), now]);
+  await connection.run(
+    `INSERT INTO phase7_state (key, value, updated_at)
+     VALUES ('completed_at', ?, ?)
+     ON CONFLICT (key) DO NOTHING`,
+    [String(now), now],
+  );
+  // Persist a final point-in-time report after the completion marker is written.
+  await sendPaperStatusReportUnlocked(connection);
   console.log("[PAPER] ===== ONE-WEEK PAPER TRADING PERIOD COMPLETED =====");
   const tradeCount = asNumber(summary[0]!.trades);
   const winnerCount = asNumber(summary[0]!.winners);
@@ -650,10 +772,9 @@ async function runPaperTradingCycleUnlocked(
   changes: SignalChange[] = [],
 ): Promise<void> {
   const startedAt = await getStateNumber(connection, "started_at");
-  if (!startedAt) return;
+  if (!startedAt || await isPhase7Completed(connection)) return;
+
   if (Date.now() >= startedAt + PHASE7_CONFIG.durationMs) {
-    await closeOnStops(connection);
-    await closeOnPrimaryReversals(connection);
     await reportIfExpired(connection);
     return;
   }
@@ -661,11 +782,15 @@ async function runPaperTradingCycleUnlocked(
   await dailyReport(connection);
   for (const change of changes) {
     if ((PHASE7_CONFIG.monitorTimeframes as readonly string[]).includes(change.timeframe)) {
-      console.log(`[MONITOR] ${change.symbol} ${change.timeframe}: ${change.previousSignal ?? "NEW"} -> ${change.currentSignal} (monitor only)`);
+      console.log(
+        `[MONITOR] ${change.symbol} ${change.timeframe}: ` +
+        `${change.previousSignal ?? "NEW"} -> ${change.currentSignal} (monitor only)`,
+      );
       continue;
     }
     await processPrimaryChange(connection, change);
   }
+
   await closeOnStops(connection);
   await closeOnPrimaryReversals(connection);
   await processPendingEntries(connection);
@@ -676,6 +801,29 @@ export function runPaperTradingCycle(
   changes: SignalChange[] = [],
 ): Promise<void> {
   return withSerializedDatabaseOperation(() => runPaperTradingCycleUnlocked(connection, changes));
+}
+
+/**
+ * Called after a successful price-candle save. This keeps stop/target checks
+ * and already-confirmed pending entries moving even during signal API outages.
+ */
+export function runPaperTradingPriceCycle(
+  connection: DatabaseConnection,
+): Promise<void> {
+  return withSerializedDatabaseOperation(async () => {
+    const startedAt = await getStateNumber(connection, "started_at");
+    if (!startedAt || await isPhase7Completed(connection)) return;
+
+    if (Date.now() >= startedAt + PHASE7_CONFIG.durationMs) {
+      await reportIfExpired(connection);
+      return;
+    }
+
+    await dailyReport(connection);
+    await closeOnStops(connection);
+    await closeOnPrimaryReversals(connection);
+    await processPendingEntries(connection);
+  });
 }
 
 async function logPaperTradingStatusUnlocked(connection: DatabaseConnection): Promise<void> {

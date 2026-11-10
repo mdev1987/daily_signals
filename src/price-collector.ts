@@ -1,7 +1,7 @@
 import {
   PRICE_INTERVALS,
   fetchCandles,
-  loadMappedSymbols,
+  loadUniqueMappedSymbols,
   type MappedSymbol,
   type PriceCandle,
   type PriceInterval,
@@ -12,6 +12,7 @@ import {
   type DatabaseConnection,
   type PriceSaveResult,
 } from "./database";
+import { runPaperTradingPriceCycle } from "./paper-trading";
 
 export interface PriceCollectionResult {
   symbols: number;
@@ -64,7 +65,7 @@ export async function collectPricesOnce(
   connection: DatabaseConnection,
 ): Promise<PriceCollectionResult> {
   const startedAt = Date.now();
-  const mappings = await loadMappedSymbols();
+  const mappings = await loadUniqueMappedSymbols();
 
   const jobs: Job[] = mappings.flatMap((mapping) =>
     PRICE_INTERVALS.map((interval) => ({ mapping, interval })),
@@ -99,6 +100,12 @@ export async function collectPricesOnce(
   );
 
   const saved = await savePriceCandles(connection, candles);
+
+  // Price-driven exits and confirmed pending entries must continue even when
+  // the signal provider is temporarily unavailable. This also runs when this
+  // fetch returned no new rows, so existing fresh quotes can finish a pending
+  // confirmation without waiting for another signal poll.
+  await runPaperTradingPriceCycle(connection);
 
   if (errors.length > 0) {
     for (const message of errors) {

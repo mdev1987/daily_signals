@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { PHASE7_CONFIG, signalDirection } from "../paper-trading";
+import {
+  PHASE7_CONFIG,
+  isDirectionalReversal,
+  signalDirection,
+} from "../paper-trading";
 import { timeframeToMs } from "../config";
 
 describe("Phase 7 operational strategy", () => {
@@ -26,6 +30,16 @@ describe("Phase 7 operational strategy", () => {
     expect(signalDirection("SELL")).toBe("short");
     expect(signalDirection("STRONG_SELL")).toBe("short");
     expect(signalDirection("NEUTRAL")).toBeNull();
+  });
+
+  test("only an explicit opposite direction closes a position", () => {
+    expect(isDirectionalReversal("SELL", "long")).toBe(true);
+    expect(isDirectionalReversal("STRONG_SELL", "long")).toBe(true);
+    expect(isDirectionalReversal("BUY", "short")).toBe(true);
+    expect(isDirectionalReversal("NEUTRAL", "long")).toBe(false);
+    expect(isDirectionalReversal("NEUTRAL", "short")).toBe(false);
+    expect(isDirectionalReversal("BUY", "long")).toBe(false);
+    expect(isDirectionalReversal("SELL", "short")).toBe(false);
   });
 
   test("keeps the one-week and five-minute confirmation rules fixed", () => {

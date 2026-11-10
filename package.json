@@ -10,7 +10,8 @@
     "validate": "bun run src/validate.ts",
     "e4": "bun run src/e4-cli.ts",
     "e3": "bun run src/e3-cli.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "audit:deep": "bun run src/deep-audit.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

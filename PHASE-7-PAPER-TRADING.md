@@ -107,3 +107,43 @@ Do not move to real-money trading solely because the seven-day PnL is positive. 
 - `1d` and `5h` signals use the same `5m` price proxy as `1h` signals.
 - Signal baselines already present when the experiment starts do not cause immediate entries. A new primary-timeframe signal transition is required, avoiding retrospective entries on stale state.
 - The experiment is not a recommendation to trade live.
+
+## Phase 7 rewrite notes
+
+### Code changes
+
+- A position now closes on an explicit opposite directional signal only. `NEUTRAL` and missing signal rows do not trigger reversal exits.
+- Added a price-driven paper-trading cycle after each price collection pass. Stop/target processing, reversal checks, and already-confirmed pending entries can progress while signal polling is unavailable.
+- Stop/target replay now consumes only fully closed candles and accepts an explicit cutoff. At experiment expiry, candles are replayed only up to the nominal experiment end before final liquidation.
+- `completed_at` is now a terminal guard: after it exists, later signal and price cycles do not mutate paper-trading state.
+- Exit fees are calculated from exit execution notional (`quantity * adverseExit`). Status reports no longer show stale/missing quotes as zero unrealized PnL.
+- Trade close is committed before Telegram notification. Telegram failures are caught and do not undo or block the recorded exit.
+- Daily report delivery state records `sent` or `failed`; failed delivery is retried no more than once per hour.
+- Active symbol aliases are retained for signal-to-canonical resolution. Price collection separately deduplicates canonical instruments to avoid duplicate market-data requests.
+- Added regression coverage for explicit directional reversal versus `NEUTRAL`.
+- Added `src/deep-audit.ts` and `audit:deep` script.
+
+### Deep audit
+
+The audit opens the existing DuckDB file in `READ_ONLY` mode and refuses to create a new database if the path does not exist. DuckDB does not support a separate process reading the same file while another process owns a read-write connection, so briefly stop `daily-signals` for the audit and start it again afterward. This causes a short data-collection pause but does not alter database records.
+
+Default:
+```bash
+bun run audit:deep
+```
+
+Explicit paths:
+```bash
+bun run src/deep-audit.ts ./data/signals.duckdb ./deep_audit_vps_result.txt
+```
+
+The script writes `deep_audit_vps_result.txt` and includes database inventory, Phase 7 state/timing, poll state, signal coverage, every pending entry with a diagnosis, all open positions with mark-to-market estimates and freshness, complete closed-trade ledger and recalculated performance, position/trade consistency, per-symbol 5m candle freshness, and stored report reconciliation.
+
+The generated live audit output is not included in this archive because the uploaded source ZIP did not contain the VPS database. Run the script against the actual VPS database to create the final report.
+
+### Validation status
+
+- TypeScript syntax transpilation: passed for all `.ts` files in the archive.
+- `bun check` / `bun test`: not run in this environment because Bun and project dependencies are not installed here. Run both on the VPS or development machine before deployment.
+- No live database was opened or modified during this rewrite.
+- Strategy timeframes, confirmation period, duration, stop-loss, take-profit, sizing, exposure, fees, and slippage defaults were not changed.

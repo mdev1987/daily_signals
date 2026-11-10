@@ -81,3 +81,29 @@ PRICE_CANDLE_LIMIT=100
 ## Phase 7 — One-Week Paper Trading
 
 See [PHASE-7-PAPER-TRADING.md](./PHASE-7-PAPER-TRADING.md) for the operational strategy, risk settings, database tables, and review queries. The normal `bun run start` command initializes the paper engine automatically. It uses simulated funds only and never submits broker orders.
+
+## Phase 7 deep audit (read-only)
+
+Run this on the VPS against the same DuckDB file used by the service:
+
+```bash
+bun run src/deep-audit.ts
+```
+
+Or pass explicit paths:
+
+```bash
+bun run src/deep-audit.ts ./data/signals.duckdb ./deep_audit_vps_result.txt
+```
+
+The script refuses to create a database when the supplied path does not exist.
+It opens the database in DuckDB `READ_ONLY` mode. Because DuckDB does not support
+a separate process reading the same file while another process owns a read-write
+connection, briefly stop `daily-signals` before running the audit, then start it
+again. This creates a short collection gap but does not alter database records.
+It performs SELECT-only inspection and writes `deep_audit_vps_result.txt` with
+all pending entries, open positions, the complete closed-trade ledger,
+recalculated performance, price freshness, poll state, position/trade
+consistency checks, and stored-report reconciliation. It does not reset or
+modify the database.
+
