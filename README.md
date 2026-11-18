@@ -122,9 +122,9 @@ requests.
 | Component | ApeX Omni | Paradex | Lighter |
 | --- | --- | --- | --- |
 | Public mainnet market data | Working (139 markets, 89 eligible) | Working (65 PERP markets, all eligible) | Working (244 markets, 209 eligible) |
-| Public testnet market data | Working (144 markets) | Working (25 PERP markets) | Working (8 markets, 7 eligible) |
-| Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey | Working on testnet (web-app deployment, 10,000 test USDC) |
-| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account | Working on testnet: leveraged market orders and reduce-only closes |
+| Public testnet market data | Working (144 markets) | Working (25 PERP markets) | Working (5 markets, 3 eligible perpetuals) |
+| Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey | Verified on testnet; the UI deployment was reset, so the account must be recreated |
+| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account | Implemented behind gates; no live testnet order run yet |
 | 5-minute backfill | Working; validated against live data | Working; validated against live data | Working; validated against live data |
 | Settlement | USDT | USDC | USDC |
 
@@ -178,8 +178,8 @@ and must be recreated in the ApeX testnet portal.
 
 ### Lighter private API status
 
-Reads work on testnet. The cause of the earlier failures was a **deployment
-mismatch**, not the key itself:
+Reads were verified on testnet. The cause of the earlier failures was a
+**deployment mismatch**, not the key itself:
 
 - The web app (`testnet.app.lighter.xyz`) talks to `api.testnet.lighter.xyz`.
 - The docs reference API is `testnet.zklighter.elliot.ai`.
@@ -187,12 +187,23 @@ mismatch**, not the key itself:
   the web app is invisible to the docs host, which reports
   `couldnt find account` or `invalid signature`.
 
-`.env` therefore pins `LIGHTER_TESTNET_BASE_URL=https://api.testnet.lighter.xyz`
-and uses the sub-account `281474976710647` created in the web app. `bun run
-lighter:account` reads 10,000 test USDC, zero positions and zero open orders.
+`.env` therefore pins `LIGHTER_TESTNET_BASE_URL=https://api.testnet.lighter.xyz`.
+With the sub-account `281474976710647` and key index 4, `bun run lighter:account`
+read 10,000 test USDC, zero positions and zero open orders.
 
-The same rule applies to every check: `apikeys` and `nextNonce` must be queried
-on the host that matches the key. `LIGHTER_MAINNET_BASE_URL` and
+**That account no longer exists.** The web-app testnet was reset between runs:
+the account returns `{"code":29404,"message":"not found"}` and its key list is
+empty, while the docs deployment still has its own accounts. Testnet is reset
+periodically, so this is expected rather than a configuration bug. Create a new
+account and API key in the web app, then update `LIGHTER_ACCOUNT_INDEX` and
+`LIGHTER_KEY_INDEX` together with the new key pair.
+
+`lighter:account` now separates the two failure modes on its own: it fetches the
+public account state on the configured host and prints whether the account
+exists, its collateral, and which key indexes are registered.
+
+The deployment rule applies to every check: `apikeys` and `nextNonce` must be
+queried on the host that matches the key. `LIGHTER_MAINNET_BASE_URL` and
 `LIGHTER_TESTNET_BASE_URL` override either side, and both are validated as
 absolute HTTPS URLs at startup.
 
@@ -519,6 +530,13 @@ protection and validation are enforced in code and by the primary key.
   account index can exist on both with different owners and keys. Point
   `LIGHTER_MAINNET_BASE_URL` / `LIGHTER_TESTNET_BASE_URL` at the host where the
   key was created, and query `apikeys` and `nextNonce` on that same host.
+- **Lighter testnet resets:** the web-app testnet is wiped periodically. Accounts
+  and keys then return `29404 not found` even though the same index may still
+  exist on the docs deployment. Recreate the account and key; no code change is
+  required.
+- **Lighter reconcile scope:** orphan positions are only closed for symbols in
+  `LIGHTER_EXECUTION_SYMBOLS`. Remove a symbol from that list while a position is
+  open and the bridge will no longer manage it.
 - **Lighter order price:** every order, including a market order, carries a
   price — it is the worst acceptable execution price, so it cannot be omitted.
 - **Lighter funding history:** `/api/v1/fundings` reports 1h or 1d entries with
@@ -544,3 +562,12 @@ needs funding before the order-lifecycle phase: it authenticates but
 With public ingestion stable on three venues, the recommended next milestones
 are the public WebSocket ingestor and candle-manager wiring, then funding rates
 and execution costs (Phase 8). Live trading stays disabled on all venues.
+
+### Execution safety additions
+
+- `LIGHTER_SIZE_MULTIPLIER` (default 1) scales the paper quantity sent to the venue.
+- `connect()` refuses a leverage whose liquidation distance is under 2x the paper stop loss.
+- Opens are skipped (audited as `SKIPPED`) when the venue already holds a position on the symbol, margin is insufficient, or the size is below the venue minimum.
+- Closes are skipped when the venue has no position; closes are always reduce-only.
+- The reconciler keeps running after the Phase 7 session ends.
+- Not implemented: venue-side stop-loss/take-profit orders; stops are still evaluated by the paper engine on closed 5m candles.

@@ -853,10 +853,18 @@ async function runPaperTradingCycleUnlocked(
   changes: SignalChange[] = [],
 ): Promise<void> {
   const startedAt = await getStateNumber(connection, "started_at");
-  if (!startedAt || await isPhase7Completed(connection)) return;
+  if (!startedAt) return;
+
+  // After the session ends no new trades open, but venue positions must keep
+  // being reconciled so nothing is left running unmanaged on the account.
+  if (await isPhase7Completed(connection)) {
+    await notifyReconcile(connection);
+    return;
+  }
 
   if (Date.now() >= startedAt + PHASE7_CONFIG.durationMs) {
     await reportIfExpired(connection);
+    await notifyReconcile(connection);
     return;
   }
 
@@ -894,10 +902,16 @@ export function runPaperTradingPriceCycle(
 ): Promise<void> {
   return withSerializedDatabaseOperation(async () => {
     const startedAt = await getStateNumber(connection, "started_at");
-    if (!startedAt || await isPhase7Completed(connection)) return;
+    if (!startedAt) return;
+
+    if (await isPhase7Completed(connection)) {
+      await notifyReconcile(connection);
+      return;
+    }
 
     if (Date.now() >= startedAt + PHASE7_CONFIG.durationMs) {
       await reportIfExpired(connection);
+      await notifyReconcile(connection);
       return;
     }
 

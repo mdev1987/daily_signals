@@ -1,5 +1,63 @@
 import { LighterAdapter } from "./lighter.adapter";
-import { describeLighterConfig, loadLighterConfig } from "./lighter.config";
+import { describeLighterConfig, loadLighterConfig, type LighterConfig } from "./lighter.config";
+
+/**
+ * Public, signature-free view of the account on the host being used. It
+ * separates "the account is gone" (a testnet reset or a deleted account) from
+ * "the key index is wrong", which the signed error alone cannot tell apart.
+ */
+async function describeAccountOnHost(config: LighterConfig): Promise<void> {
+  const base = config.baseUrls[config.privateApiEnvironment];
+  const accountIndex = config.credentials.accountIndex;
+  if (accountIndex === null) return;
+
+  try {
+    const accountResponse = await fetch(
+      `${base}/api/v1/account?by=index&value=${accountIndex}`,
+      { signal: AbortSignal.timeout(10_000) },
+    );
+    const accountBody = (await accountResponse.json()) as {
+      code?: number;
+      accounts?: Array<{ collateral?: string }>;
+    };
+    const account = accountBody.accounts?.[0];
+
+    if (!account) {
+      console.error(
+        `  - Account ${accountIndex} does not exist on ${base} (code ` +
+          `${accountBody.code ?? "?"}). Testnet is reset periodically and ` +
+          `deleted accounts stay deleted, so the account and its keys must be ` +
+          `created again in the web app.`,
+      );
+      return;
+    }
+
+    console.error(
+      `  - Account ${accountIndex} exists on ${base} with collateral ` +
+        `${account.collateral ?? "?"}; the key index or key pair is wrong.`,
+    );
+
+    const keysResponse = await fetch(
+      `${base}/api/v1/apikeys?account_index=${accountIndex}&api_key_index=255`,
+      { signal: AbortSignal.timeout(10_000) },
+    );
+    const keysBody = (await keysResponse.json()) as {
+      api_keys?: Array<{ api_key_index?: number }>;
+    };
+    const indexes = (keysBody.api_keys ?? [])
+      .map((key) => key.api_key_index)
+      .filter((index): index is number => typeof index === "number");
+
+    console.error(
+      `  - Registered key indexes on that account: ` +
+        `${indexes.length > 0 ? indexes.join(", ") : "none"}`,
+    );
+  } catch (error) {
+    console.error(
+      `  - Could not read the public account state: ${String(error)}`,
+    );
+  }
+}
 
 /**
  * Read-only Lighter account check.
@@ -81,6 +139,7 @@ async function main(): Promise<void> {
     console.error(
       "  - Run `bun run lighter:setup` if the wasm signer is missing",
     );
+    await describeAccountOnHost(config);
     process.exitCode = 1;
   } finally {
     await adapter.close();

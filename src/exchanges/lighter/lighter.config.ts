@@ -48,6 +48,12 @@ export interface LighterExecutionConfig {
   allowMainnetExecution: boolean;
   /** How often venue positions are reconciled against paper positions. */
   reconcileIntervalMs: number;
+  /**
+   * Multiplies the paper quantity before it is sent to the venue. The paper
+   * book is small (default $1,000 at 2% per trade = $20), which can fall
+   * below the venue's minimum order size. 1 mirrors the paper size exactly.
+   */
+  sizeMultiplier: number;
 }
 
 export interface LighterConfig {
@@ -286,6 +292,17 @@ function readExecutionConfig(
     );
   }
 
+  const sizeMultiplier = readDecimal(
+    env.LIGHTER_SIZE_MULTIPLIER,
+    1,
+    "LIGHTER_SIZE_MULTIPLIER",
+  );
+  if (!(sizeMultiplier > 0) || sizeMultiplier > 1_000) {
+    throw new ExchangeConfigurationError(
+      "LIGHTER_SIZE_MULTIPLIER must be greater than 0 and at most 1000",
+    );
+  }
+
   return {
     enabled: readBoolean(env.LIGHTER_EXECUTION_ENABLED, false),
     leverage,
@@ -297,6 +314,7 @@ function readExecutionConfig(
       false,
     ),
     reconcileIntervalMs,
+    sizeMultiplier,
   };
 }
 
@@ -441,4 +459,36 @@ export function describeLighterConfig(config: LighterConfig) {
     wasmExecPath: config.wasmExecPath,
     execution: config.execution,
   };
+}
+
+/**
+ * Fraction of the entry price the market can move against a leveraged position
+ * before the venue liquidates it, with a safety haircut for maintenance margin
+ * and fees. At 5x the raw distance is 20%; at 50x it is only 2%.
+ */
+export function liquidationDistancePct(leverage: number): number {
+  return (100 / leverage) * 0.8;
+}
+
+/**
+ * The paper engine's stop loss only exists in the simulation (it is evaluated
+ * on closed 5m candles). If the venue would liquidate the position before that
+ * stop level, the mirror can lose the whole margin while paper shows a small
+ * stop-out. Refuse that combination instead of trading it.
+ */
+export function assertStopBeforeLiquidation(
+  config: LighterConfig,
+  stopLossPct: number,
+): void {
+  const distance = liquidationDistancePct(config.execution.leverage);
+
+  // Require a 2x buffer: candle-close stops can overshoot the stop level.
+  if (stopLossPct * 2 > distance) {
+    throw new ExchangeConfigurationError(
+      `LIGHTER_LEVERAGE=${config.execution.leverage}x puts liquidation about ` +
+        `${distance.toFixed(1)}% from entry, too close to the ${stopLossPct}% ` +
+        `paper stop loss (needs at least 2x headroom). Lower the leverage or ` +
+        `the stop loss.`,
+    );
+  }
 }

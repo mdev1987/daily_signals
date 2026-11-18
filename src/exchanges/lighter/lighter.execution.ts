@@ -4,8 +4,10 @@ import {
 } from "../../database";
 import type { MarketInfo, Order, OrderBook, Position } from "../exchange.types";
 import { LighterAdapter } from "./lighter.adapter";
+import { PAPER_STOP_LOSS_PCT } from "../../config";
 import {
   assertLighterExecutionAllowed,
+  assertStopBeforeLiquidation,
   loadLighterConfig,
   type LighterConfig,
 } from "./lighter.config";
@@ -33,12 +35,18 @@ export interface PaperExecutionPosition {
   notional: number;
 }
 
-export type ExecutionAction = "OPEN" | "CLOSE" | "RECONCILE_CLOSE";
+export type ExecutionAction =
+  | "OPEN"
+  | "CLOSE"
+  | "RECONCILE_CLOSE"
+  | "SKIPPED";
 
 export interface LighterExecutionBridgeOptions {
   connection: DatabaseConnection;
   config?: LighterConfig;
   adapter?: LighterAdapter;
+  /** Paper stop loss, used to reject leverage that liquidates before it. */
+  stopLossPct?: number;
   log?: (message: string) => void;
   /** Injectable clock and sleep keep the unit tests deterministic. */
   now?: () => number;
@@ -113,6 +121,7 @@ export class LighterExecutionBridge {
   private readonly config: LighterConfig;
   private readonly adapter: LighterAdapter;
   private readonly connection: DatabaseConnection;
+  private readonly stopLossPct: number;
   private readonly log: (message: string) => void;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -134,6 +143,7 @@ export class LighterExecutionBridge {
     };
     this.adapter = options.adapter ?? new LighterAdapter({ config: this.config });
     this.connection = options.connection;
+    this.stopLossPct = options.stopLossPct ?? PAPER_STOP_LOSS_PCT;
     this.log = options.log ?? ((message) => console.log(message));
     this.now = options.now ?? (() => Date.now());
     this.sleep =
@@ -144,6 +154,7 @@ export class LighterExecutionBridge {
   /** Opens the signing client, applies leverage and prepares the audit table. */
   async connect(): Promise<void> {
     assertLighterExecutionAllowed(this.config);
+    assertStopBeforeLiquidation(this.config, this.stopLossPct);
     await this.ensureAuditTable();
     await this.adapter.connect();
 
@@ -229,46 +240,87 @@ export class LighterExecutionBridge {
       return;
     }
 
-    const market = await this.market(symbol);
-
-    try {
-      await this.ensureLeverage(symbol);
-    } catch (error) {
-      // An existing leverage setting is still usable; refusing to trade would
-      // be worse than trading at the account's current margin.
-      this.log(
-        `[EXEC] WARN could not set ${this.config.execution.leverage}x on ${symbol}: ` +
-          this.adapter.redact(error),
-      );
-    }
-
-    const amount = floorToAmountStep(position.quantity, market.amountStep);
-    if (!(amount > 0)) {
-      this.log(`[EXEC] OPEN ${symbol} skipped: quantity ${position.quantity} rounds to zero`);
-      return;
-    }
-    if (market.minAmount !== null && amount < market.minAmount) {
-      this.log(
-        `[EXEC] OPEN ${symbol} skipped: ${amount} is below min amount ${market.minAmount}`,
-      );
-      return;
-    }
-
     const side = position.direction === "long" ? "buy" : "sell";
-    const price = await this.worstPrice(symbol, side);
-    if (price === null) {
-      throw new Error(`no usable ${side} price for ${symbol}`);
-    }
-
-    if (market.minCost !== null && amount * price < market.minCost) {
-      this.log(
-        `[EXEC] OPEN ${symbol} skipped: notional ${(amount * price).toFixed(2)} ` +
-          `is below min ${market.minCost}`,
-      );
-      return;
-    }
+    let amount = 0;
+    let price: number | null = null;
 
     try {
+      const market = await this.market(symbol);
+
+      try {
+        await this.ensureLeverage(symbol);
+      } catch (error) {
+        // An existing leverage setting is still usable; refusing to trade
+        // would be worse than trading at the account's current margin.
+        this.log(
+          `[EXEC] WARN could not set ${this.config.execution.leverage}x on ${symbol}: ` +
+            this.adapter.redact(error),
+        );
+      }
+
+      // A venue position that paper does not know about (a close that failed,
+      // or a manual trade) must not be stacked onto. Adding to it would make
+      // the later reduce-only close mirror the wrong size.
+      const existing = await this.positionsFor(symbol);
+      if (existing.length > 0) {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `venue already holds ${existing[0]!.side} ${Math.abs(existing[0]!.contracts)}`,
+        );
+        return;
+      }
+
+      amount = floorToAmountStep(
+        position.quantity * this.config.execution.sizeMultiplier,
+        market.amountStep,
+      );
+      if (!(amount > 0)) {
+        await this.skip(position, symbol, side, `quantity ${position.quantity} rounds to zero`);
+        return;
+      }
+      if (market.minAmount !== null && amount < market.minAmount) {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `${amount} is below min amount ${market.minAmount} ` +
+            `(raise LIGHTER_SIZE_MULTIPLIER)`,
+        );
+        return;
+      }
+
+      price = await this.worstPrice(symbol, side);
+      if (price === null) {
+        throw new Error(`no usable ${side} price for ${symbol}`);
+      }
+
+      if (market.minCost !== null && amount * price < market.minCost) {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `notional ${(amount * price).toFixed(2)} is below min ${market.minCost} ` +
+            `(raise LIGHTER_SIZE_MULTIPLIER)`,
+        );
+        return;
+      }
+
+      // Leveraged margin check: the venue would reject an unfunded order, but
+      // a clear local reason is easier to act on than a signer error.
+      const requiredMargin = (amount * price) / this.config.execution.leverage;
+      const free = await this.freeUsdc();
+      if (free !== null && requiredMargin > free) {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `needs ${requiredMargin.toFixed(2)} USDC margin but only ${free.toFixed(2)} is free`,
+        );
+        return;
+      }
+
       const order = await this.adapter.createOrder({
         symbol,
         type: "market",
@@ -308,33 +360,35 @@ export class LighterExecutionBridge {
     const symbol = this.toVenueSymbol(position.symbol);
     if (!symbol) return;
 
-    const venue = await this.positionsFor(symbol);
-    const held = venue.find((item) => Math.abs(item.contracts) > 0);
-    const market = await this.market(symbol);
-
-    const amount = held
-      ? Math.abs(held.contracts)
-      : floorToAmountStep(position.quantity, market.amountStep);
-
-    if (!(amount > 0)) {
-      this.log(`[EXEC] CLOSE ${symbol} skipped: nothing to close`);
-      return;
-    }
-
-    const side = held
-      ? held.side === "long"
-        ? "sell"
-        : "buy"
-      : position.direction === "long"
-        ? "sell"
-        : "buy";
-
-    const price = await this.worstPrice(symbol, side);
-    if (price === null) {
-      throw new Error(`no usable ${side} price for ${symbol}`);
-    }
+    const fallbackSide = position.direction === "long" ? "sell" : "buy";
+    let side: "buy" | "sell" = fallbackSide;
+    let amount = 0;
+    let price: number | null = null;
 
     try {
+      const held = (await this.positionsFor(symbol))[0];
+
+      // Nothing on the venue means the entry never filled (thin testnet book)
+      // or was already closed. A reduce-only order would only be noise.
+      if (!held) {
+        await this.skip(
+          position,
+          symbol,
+          fallbackSide,
+          `nothing to close on the venue (${exitReason})`,
+          "CLOSE",
+        );
+        return;
+      }
+
+      amount = Math.abs(held.contracts);
+      side = held.side === "long" ? "sell" : "buy";
+
+      price = await this.worstPrice(symbol, side);
+      if (price === null) {
+        throw new Error(`no usable ${side} price for ${symbol}`);
+      }
+
       const order = await this.adapter.createOrder({
         symbol,
         type: "market",
@@ -357,7 +411,8 @@ export class LighterExecutionBridge {
 
       this.log(
         `[EXEC] CLOSE ${symbol} ${side.toUpperCase()} ${amount} (reduce only) ` +
-          `@ worst ${price.toFixed(4)} | ${exitReason} | order ${order.id ?? "?"} ${order.status}`,
+          `@ worst ${price.toFixed(4)} | ${exitReason} | ` +
+          `order ${orderReference(order) ?? "?"} ${orderAuditStatus(order)}`,
       );
 
       await this.verifyClosed(symbol);
@@ -478,6 +533,35 @@ export class LighterExecutionBridge {
       ticker.last,
       this.config.execution.worstPriceSlippagePct,
     );
+  }
+
+  /** Free USDC collateral, or null when the venue does not report it. */
+  private async freeUsdc(): Promise<number | null> {
+    const balances = await this.adapter.getBalance();
+    const usdc = balances.find((entry) => entry.currency.toUpperCase() === "USDC");
+    return usdc && Number.isFinite(usdc.free) ? usdc.free : null;
+  }
+
+  /** Logs and audits a deliberate no-op so it is never mistaken for a fill. */
+  private async skip(
+    position: PaperExecutionPosition,
+    symbol: string,
+    side: string,
+    reason: string,
+    action: ExecutionAction = "OPEN",
+  ): Promise<void> {
+    this.log(`[EXEC] ${action} ${symbol} skipped: ${reason}`);
+    await this.record({
+      paperPositionId: position.id,
+      action: "SKIPPED",
+      symbol,
+      side,
+      amount: 0,
+      price: null,
+      orderId: null,
+      status: `SKIPPED_${action}`,
+      error: reason.slice(0, 1_000),
+    }).catch(() => undefined);
   }
 
   private async positionsFor(symbol: string): Promise<Position[]> {
