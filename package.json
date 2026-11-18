@@ -16,6 +16,7 @@
     "apex:markets": "EXCHANGE=apex bun run src/market-data/market-metadata.ts",
     "apex:backfill": "EXCHANGE=apex bun run src/market-data/backfill-cli.ts",
     "paradex:smoke": "bun run src/exchanges/paradex/smoke-test.ts",
+  "paradex:account": "bun run src/exchanges/paradex/account-check.ts",
     "paradex:markets": "EXCHANGE=paradex bun run src/market-data/market-metadata.ts",
     "paradex:backfill": "EXCHANGE=paradex bun run src/market-data/backfill-cli.ts",
     "markets": "bun run src/market-data/market-metadata.ts",
@@ -38,6 +39,7 @@
     "ethers": "^6.17.0",
     "finnhub": "^2.0.16",
     "grammy": "^1.46.0",
+    "starknet": "^8.9.2",
     "telegram-markdown-v2": "^0.0.5",
     "tor-js": "^0.4.4"
   }

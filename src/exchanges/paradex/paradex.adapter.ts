@@ -27,6 +27,11 @@ import {
   type RawBalances,
 } from "../normalizers";
 import {
+  authenticateParadexClient,
+  refreshParadexAuthIfNeeded,
+  type ParadexAuthToken,
+} from "./paradex.auth";
+import {
   createParadexPrivateClient,
   createParadexPublicClient,
   loadParadexPerpetualMarkets,
@@ -76,6 +81,7 @@ export class ParadexAdapter implements ExchangeAdapter {
   private readonly config: ParadexConfig;
   private readonly publicClient: ParadexClient;
   private privateClient: ParadexClient | null = null;
+  private authInfo: ParadexAuthToken | null = null;
   private markets: MarketInfo[] | null = null;
 
   constructor(options: ParadexAdapterOptions = {}) {
@@ -276,10 +282,24 @@ export class ParadexAdapter implements ExchangeAdapter {
       // Preload only perpetuals so private calls do not download the full
       // option-heavy market list on first use.
       await loadParadexPerpetualMarkets(client);
+      // CCXT only signs in with the account's main key. Minting the JWT here
+      // also covers subkeys and is reused by every private call.
+      this.authInfo = await authenticateParadexClient(client, this.config);
       this.privateClient = client;
+    } else {
+      await refreshParadexAuthIfNeeded(this.privateClient, this.config);
     }
 
     return this.privateClient;
+  }
+
+  /** Which auth endpoint the private key was accepted at, once known. */
+  getAuthInfo(): { endpoint: string; expiresAtMs: number } | null {
+    if (!this.authInfo) return null;
+    return {
+      endpoint: this.authInfo.endpoint,
+      expiresAtMs: this.authInfo.expiresAtMs,
+    };
   }
 
   /** Safe error text for logs; never includes account keys. */

@@ -114,6 +114,7 @@ adapter; Paradex is the second.
 CCXT is the primary interface for market data and order plumbing on both
 venues. `@paradex/sdk` and `ethers` are installed for wallet/account-specific
 work (onboarding, key derivation) and are not part of the research path.
+`starknet` signs the Paradex auth request.
 
 ### Current status
 
@@ -121,8 +122,8 @@ work (onboarding, key derivation) and are not part of the research path.
 | --- | --- | --- |
 | Public mainnet market data | Working (139 markets, 89 eligible) | Working (65 PERP markets, all eligible) |
 | Public testnet market data | Working (144 markets) | Working (25 PERP markets) |
-| Private account reads | Working on mainnet, opt-in | Configured, blocked by account onboarding |
-| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and account onboarding |
+| Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey |
+| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account |
 | 5-minute backfill | Working; validated against live data | Working; validated against live data |
 | Settlement | USDT | USDC |
 
@@ -136,16 +137,35 @@ stored 189 and 120 finalized candles with zero invalid or duplicate rows.
 
 ### Private API status
 
-The Paradex account keypair in `.env` authenticates structurally but is not
-usable for reads yet:
+Reads work on testnet. The key in `.env` is a **subkey**, not the account's
+main key, which is why the obvious paths fail:
 
-- **Testnet:** `STARKNET_SIGNATURE_VERIFICATION_FAILED` — the supplied public
-  key does not match the account registered at that address.
-- **Mainnet:** `NOT_ONBOARDED` — the account has never called `/onboarding`.
+- `POST /v1/auth` verifies against the account's main key, so a subkey gets
+  `STARKNET_SIGNATURE_VERIFICATION_FAILED`.
+- `GET /onboarding?public_key=…` reports `exists: false` for subkeys because
+  only main keys are registered there.
+- `/v1/auth/{public_key}` is the subkey endpoint. The signed message still says
+  `/v1/auth`; only the path the server verifies against changes.
 
-Create or re-onboard the account in the Paradex portal and copy the three
-account values again. Until then `PARADEX_PRIVATE_API_ENABLED` stays false and
-no order can be submitted.
+`PARADEX_AUTH_MODE=auto` tries the account endpoint first and falls back to the
+subkey endpoint only when the venue reports a signature verification failure.
+The minted JWT is attached to the CCXT client, so every private call reuses it
+and CCXT never re-signs with the wrong key. `bun run paradex:account` reports
+which endpoint accepted the key.
+
+Two other findings:
+
+- **Mainnet private API is geo-blocked here:** requests return
+  `GEO_IP_BLOCK` (`Service access restricted in your region`, country `IR`).
+  Public mainnet market data is unaffected; private reads must use testnet.
+- **The testnet account authenticates but is unfunded:** `/balance` is empty
+  and `/account/summary` returns `account_value: 0`, `status: UNSPECIFIED`.
+  New testnet accounts are credited with 1,000,000 test USDC shortly after
+  creation, so this account needs funding (or a new sub-account, which is also
+  credited, then a Portfolio transfer).
+
+`PARADEX_PRIVATE_API_ENABLED` can therefore be true for reads. Order submission
+still needs all of its own gates plus a funded account.
 
 The ApeX testnet key remains a separate blocker: the supplied key is mainnet-only
 and must be recreated in the ApeX testnet portal.
@@ -160,6 +180,12 @@ it explicitly.
 # Public market-data smoke tests (no credentials, no orders)
 bun run apex:smoke
 bun run paradex:smoke
+
+# Read-only account check on testnet (mints a JWT, reads balance/positions/orders)
+bun run paradex:account
+
+# Which endpoint accepted the key? account, subkey, or auto (default)
+PARADEX_AUTH_MODE=subkey bun run paradex:account
 
 # Sync market metadata into DuckDB and print the initial universe
 bun run apex:markets
@@ -199,6 +225,7 @@ PARADEX_MARKET_DATA_ENV=testnet
 PARADEX_PRIVATE_API_ENABLED=false
 PARADEX_PRIVATE_API_ENV=testnet
 PARADEX_ORDER_SUBMISSION_ENABLED=false
+PARADEX_AUTH_MODE=auto
 
 TRADING_MODE=paper
 LIVE_TRADING_ENABLED=false
@@ -237,6 +264,17 @@ wallet (`PARADEX_WALLET_ADDRESS`, `PARADEX_EVM_PRIVATE_KEY`) from which Paradex
 derives the account. `PARADEX_PUBLICK_KEY` keeps its historical spelling so the
 existing local `.env` keeps working.
 
+The keypair may be the account's main key or a **subkey**. Subkeys are the safer
+choice: they can trade and read but cannot withdraw or transfer. They only work
+at `/v1/auth/{public_key}`, which `PARADEX_AUTH_MODE=auto` detects. Set
+`PARADEX_AUTH_MODE=account` or `subkey` to skip detection. All three values are
+required: the public key is the identity the venue verifies, and the address is
+the account the key belongs to.
+
+Read-only tokens (Settings → Key Management → Read-only) are the lowest-risk
+option for pure monitoring, but this adapter currently authenticates with the
+keypair only.
+
 `.env.example` keeps testnet for Paradex market data. The local `.env` points
 market data at mainnet while private access and execution stay on testnet, so
 research reads real candles without touching a production account.
@@ -272,9 +310,11 @@ src/exchanges/
 │   └── smoke-test.ts
 └── paradex/
     ├── paradex.adapter.ts
+    ├── paradex.auth.ts        # SNIP-12 auth, subkey support, JWT refresh
     ├── paradex.client.ts
     ├── paradex.config.ts
     ├── paradex.market-mapper.ts
+    ├── account-check.ts
     └── smoke-test.ts
 
 src/market-data/
@@ -330,6 +370,13 @@ protection and validation are enforced in code and by the primary key.
   `asset_kind=PERP`, which is ~65 KB, and retries the request with backoff.
 - **Paradex timeframes:** the venue supports `1m`, `3m`, `5m`, `15m`, `30m`
   and `1h`; other timeframes are rejected before a request is made.
+- **Paradex auth timestamps:** `PARADEX-TIMESTAMP` and
+  `PARADEX-SIGNATURE-EXPIRATION` are Unix **seconds**, and the signature is a
+  JSON array of **decimal** strings. Hex components are rejected as
+  `INVALID_TOKEN`, which hides the real cause.
+- **Paradex mainnet private API:** geo-blocked from this network
+  (`GEO_IP_BLOCK`, country `IR`). Public mainnet market data still works, so
+  research candles are unaffected; account reads run on testnet.
 - The still-forming candle is never stored. `CandleManager` guarantees that a
   completed candle triggers evaluation exactly once, including after a restart.
 - `getTicker()` on ApeX has last price only. Use `getOrderBook()` when a bid/ask
@@ -339,7 +386,10 @@ protection and validation are enforced in code and by the primary key.
 
 ### Next step
 
-Paradex account onboarding is the remaining blocker for private reads and the
-order-lifecycle phase. Until it is resolved, the recommended next milestones are
-the public WebSocket ingestor and candle-manager wiring, then funding rates and
-execution costs (Phase 8). Live trading stays disabled on both venues.
+Paradex private reads work on testnet with a subkey. The testnet account still
+needs funding before the order-lifecycle phase: it authenticates but
+`/account/summary` reports `account_value: 0` and status `UNSPECIFIED`.
+
+With reads unblocked, the recommended next milestones are the public WebSocket
+ingestor and candle-manager wiring, then funding rates and execution costs
+(Phase 8). Live trading stays disabled on both venues.

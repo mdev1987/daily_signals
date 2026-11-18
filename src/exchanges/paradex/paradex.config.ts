@@ -19,6 +19,16 @@ export type { TradingMode };
  */
 export type ParadexAuthMode = "starknet" | "evm";
 
+/**
+ * How a StarkNet keypair authenticates.
+ *
+ * - `auto`: try the account endpoint, then the subkey endpoint.
+ * - `account`: the key is the account's main key.
+ * - `subkey`: the key is a registered subkey, which must sign in at
+ *   `/v1/auth/{public_key}`.
+ */
+export type ParadexAuthStrategy = "auto" | "account" | "subkey";
+
 export interface ParadexCredentials {
   /** EVM wallet address (0x + 40 hex), optional. */
   walletAddress: string;
@@ -46,7 +56,29 @@ export interface ParadexConfig {
   orderSubmissionEnabled: boolean;
   tradingMode: TradingMode;
   liveTradingEnabled: boolean;
+  /** Endpoint a StarkNet keypair authenticates at. */
+  authStrategy: ParadexAuthStrategy;
   credentials: ParadexCredentials;
+}
+
+function readAuthStrategy(value: string | undefined): ParadexAuthStrategy {
+  switch (value?.trim().toLowerCase()) {
+    case "account":
+    case "main":
+    case "mainkey":
+      return "account";
+    case "subkey":
+    case "sub":
+      return "subkey";
+    case "auto":
+    case undefined:
+    case "":
+      return "auto";
+    default:
+      throw new ExchangeConfigurationError(
+        `PARADEX_AUTH_MODE must be auto, account or subkey; received "${value}"`,
+      );
+  }
 }
 
 export function loadParadexConfig(
@@ -75,6 +107,7 @@ export function loadParadexConfig(
     ),
     tradingMode: readTradingMode(env.TRADING_MODE),
     liveTradingEnabled: readBoolean(env.LIVE_TRADING_ENABLED, false),
+    authStrategy: readAuthStrategy(env.PARADEX_AUTH_MODE),
     credentials: {
       walletAddress: (
         env.PARADEX_WALLET_ADDRESS ??
@@ -173,6 +206,7 @@ export function describeParadexConfig(config: ParadexConfig) {
     tradingMode: config.tradingMode,
     liveTradingEnabled: config.liveTradingEnabled,
     authMode: getParadexAuthMode(config),
+    authStrategy: config.authStrategy,
     credentialsPresent: getParadexAuthMode(config) !== null,
   };
 }
