@@ -1,6 +1,11 @@
 import type { MarketInterface } from "ccxt";
-import { ExchangeConfigurationError } from "../exchange.errors";
 import type { MarketInfo, MarketType } from "../exchange.types";
+import {
+  selectUniverse,
+  splitSymbolList,
+} from "../market-universe";
+
+export { splitSymbolList };
 
 /** Markets we consider usable by the research engine. */
 export const ELIGIBLE_SETTLE = "USDT";
@@ -110,27 +115,6 @@ export function isEligibleApexPerpetual(market: MarketInfo): boolean {
   );
 }
 
-export function splitSymbolList(value: string | undefined): string[] {
-  if (!value) return [];
-
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function matchesRequestedSymbol(market: MarketInfo, requested: string): boolean {
-  const needle = requested.trim().toUpperCase();
-  const compact = needle.replace(/[^A-Z0-9]/g, "");
-
-  return (
-    market.symbol.toUpperCase() === needle ||
-    market.exchangeSymbol.toUpperCase() === needle ||
-    market.base.toUpperCase() === needle ||
-    market.exchangeSymbol.toUpperCase().replace(/[^A-Z0-9]/g, "") === compact
-  );
-}
-
 /**
  * Resolves the initial trading universe. Explicit requests must resolve to an
  * eligible market; otherwise the default majors list is used.
@@ -140,40 +124,11 @@ export function selectInitialUniverse(
   requestedSymbols: string[] = [],
   limit: number = DEFAULT_UNIVERSE.length,
 ): MarketInfo[] {
-  const eligible = markets.filter(isEligibleApexPerpetual);
-
-  if (requestedSymbols.length > 0) {
-    const selected: MarketInfo[] = [];
-
-    for (const requested of requestedSymbols) {
-      const match = eligible.find((market) =>
-        matchesRequestedSymbol(market, requested),
-      );
-
-      if (!match) {
-        throw new ExchangeConfigurationError(
-          `Requested symbol "${requested}" is not an active linear USDT perpetual`,
-        );
-      }
-
-      if (!selected.some((market) => market.symbol === match.symbol)) {
-        selected.push(match);
-      }
-    }
-
-    return selected.slice(0, Math.max(1, limit));
-  }
-
-  const byName = new Map(
-    eligible.map((market) => [market.base.toUpperCase(), market]),
+  return selectUniverse(
+    markets,
+    isEligibleApexPerpetual,
+    DEFAULT_UNIVERSE,
+    requestedSymbols,
+    limit,
   );
-  const defaults = DEFAULT_UNIVERSE.map((base) => byName.get(base)).filter(
-    (market): market is MarketInfo => Boolean(market),
-  );
-
-  if (defaults.length > 0) return defaults.slice(0, Math.max(1, limit));
-
-  return [...eligible]
-    .sort((a, b) => a.symbol.localeCompare(b.symbol))
-    .slice(0, Math.max(1, limit));
 }

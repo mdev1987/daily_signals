@@ -104,45 +104,79 @@ modify the database.
 
 Phase 7 operational strategy, one-week paper-trading implementation, and rewrite notes live in [PHASE-7-PAPER-TRADING.md](./PHASE-7-PAPER-TRADING.md).
 
-## Crypto futures research engine (ApeX Omni)
+## Crypto futures research engine
 
-ApeX Omni is the first exchange adapter for an exchange-agnostic crypto futures
-research engine. Strategy, risk and portfolio code depend only on
-`src/exchanges/exchange.types.ts`; nothing outside `src/exchanges/apex/` imports
-CCXT or the ApeX SDK.
+The research engine is exchange-agnostic. Strategy, risk and portfolio code
+depend only on `src/exchanges/exchange.types.ts`; nothing outside
+`src/exchanges/<venue>/` imports CCXT or a venue SDK. ApeX Omni was the first
+adapter; Paradex is the second.
+
+CCXT is the primary interface for market data and order plumbing on both
+venues. `@paradex/sdk` and `ethers` are installed for wallet/account-specific
+work (onboarding, key derivation) and are not part of the research path.
 
 ### Current status
 
-| Component | Status |
-| --- | --- |
-| Public mainnet market data | Working (139 markets, 89 eligible USDT perpetuals) |
-| Public testnet market data | Working (144 markets) |
-| Private account reads | Working on mainnet, opt-in |
-| Private testnet authentication | Blocked: the supplied key is mainnet-only |
-| Order placement | Blocked by three independent gates plus missing testnet keys |
-| 5-minute backfill | Working; validated against live data |
+| Component | ApeX Omni | Paradex |
+| --- | --- | --- |
+| Public mainnet market data | Working (139 markets, 89 eligible) | Working (65 PERP markets, all eligible) |
+| Public testnet market data | Working (144 markets) | Working (25 PERP markets) |
+| Private account reads | Working on mainnet, opt-in | Configured, blocked by account onboarding |
+| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and account onboarding |
+| 5-minute backfill | Working; validated against live data | Working; validated against live data |
+| Settlement | USDT | USDC |
 
-A 30-day acceptance run of the default universe produced **86,400 finalized 5m
-candles across 10 markets** with zero gaps, duplicates, invalid rows, or
+A 30-day ApeX acceptance run of the default universe produced **86,400 finalized
+5m candles across 10 markets** with zero gaps, duplicates, invalid rows, or
 in-progress candles.
+
+Paradex uses unified symbols such as `BTC/USD:USDC` and keeps the native
+`BTC-USD-PERP` id in `exchangeSymbol`. A one-day smoke backfill of BTC and ETH
+stored 189 and 120 finalized candles with zero invalid or duplicate rows.
+
+### Private API status
+
+The Paradex account keypair in `.env` authenticates structurally but is not
+usable for reads yet:
+
+- **Testnet:** `STARKNET_SIGNATURE_VERIFICATION_FAILED` — the supplied public
+  key does not match the account registered at that address.
+- **Mainnet:** `NOT_ONBOARDED` — the account has never called `/onboarding`.
+
+Create or re-onboard the account in the Paradex portal and copy the three
+account values again. Until then `PARADEX_PRIVATE_API_ENABLED` stays false and
+no order can be submitted.
+
+The ApeX testnet key remains a separate blocker: the supplied key is mainnet-only
+and must be recreated in the ApeX testnet portal.
+
 
 ### Commands
 
+`EXCHANGE` selects the venue for the generic commands; the prefixed scripts pin
+it explicitly.
+
 ```bash
-# Public market-data smoke test (no credentials, no orders)
+# Public market-data smoke tests (no credentials, no orders)
 bun run apex:smoke
+bun run paradex:smoke
 
 # Sync market metadata into DuckDB and print the initial universe
 bun run apex:markets
+bun run paradex:markets
 
 # Backfill closed 5m candles (default: last 30 days, default majors)
 bun run apex:backfill
+bun run paradex:backfill
 
 # Explicit symbols, range and timeframe
-bun run apex:backfill --symbols=BTC,ETH,SOL --days=7 --timeframe=5m
+bun run paradex:backfill --symbols=BTC,ETH,SOL --days=7 --timeframe=5m
 
 # Continue a partial range / refresh the tail
-bun run apex:backfill --symbols=BTC --days=30 --timeframe=5m
+bun run paradex:backfill --symbols=BTC --days=30 --timeframe=5m
+
+# Generic form, venue chosen by EXCHANGE
+EXCHANGE=paradex bun run backfill --days=1
 ```
 
 The backfill is idempotent and resumable: a run whose stored range already
@@ -151,13 +185,20 @@ upserts instead of duplicating.
 
 ### Configuration
 
-Market data, private account access and execution are separate settings:
+Market data, private account access and execution are separate settings per
+venue:
 
 ```env
 APEX_MARKET_DATA_ENV=mainnet
 APEX_PRIVATE_API_ENABLED=false
 APEX_PRIVATE_API_ENV=mainnet
 APEX_ORDER_SUBMISSION_ENABLED=false
+
+PARADEX_ENV=testnet
+PARADEX_MARKET_DATA_ENV=testnet
+PARADEX_PRIVATE_API_ENABLED=false
+PARADEX_PRIVATE_API_ENV=testnet
+PARADEX_ORDER_SUBMISSION_ENABLED=false
 
 TRADING_MODE=paper
 LIVE_TRADING_ENABLED=false
@@ -167,26 +208,50 @@ OMNIAPEX_API_SECRET=
 OMNIAPEX_PASS_PHRASE=
 APEX_OMNI_SEEDS=
 
+PARADEX_PRIVATE_KEY=
+PARADEX_PUBLICK_KEY=
+PARADEX_ADDRESS=
+PARADEX_WALLET_ADDRESS=
+PARADEX_EVM_PRIVATE_KEY=
+
 RESEARCH_DATABASE_PATH=./data/research.duckdb
 APEX_SYMBOLS=
 APEX_UNIVERSE_SIZE=10
 APEX_TIMEFRAME=5m
 APEX_BACKFILL_DAYS=30
 APEX_REQUEST_DELAY_MS=250
+PARADEX_SYMBOLS=
+PARADEX_UNIVERSE_SIZE=10
+PARADEX_TIMEFRAME=5m
+PARADEX_BACKFILL_DAYS=30
+PARADEX_REQUEST_DELAY_MS=250
 ```
 
-`APEX_SYMBOLS` accepts `BTC`, `BTC-USDT` or `BTC/USDT:USDT`. Leaving it empty
+`APEX_SYMBOLS` and `PARADEX_SYMBOLS` accept a base asset (`BTC`), a unified
+symbol (`BTC/USD:USDC`) or a native id (`BTC-USD-PERP`). Leaving them empty
 selects the default majors that actually exist on the exchange.
+
+Paradex accepts two credential shapes: the account keypair from the Paradex UI
+(`PARADEX_PRIVATE_KEY`, `PARADEX_PUBLICK_KEY`, `PARADEX_ADDRESS`) or an EVM
+wallet (`PARADEX_WALLET_ADDRESS`, `PARADEX_EVM_PRIVATE_KEY`) from which Paradex
+derives the account. `PARADEX_PUBLICK_KEY` keeps its historical spelling so the
+existing local `.env` keeps working.
+
+`.env.example` keeps testnet for Paradex market data. The local `.env` points
+market data at mainnet while private access and execution stay on testnet, so
+research reads real candles without touching a production account.
 
 An order can only be submitted when **all** of these are true:
 
-1. `APEX_ORDER_SUBMISSION_ENABLED=true`
+1. `<VENUE>_ORDER_SUBMISSION_ENABLED=true`
 2. `TRADING_MODE=live`
 3. `LIVE_TRADING_ENABLED=true`
-4. `APEX_OMNI_SEEDS` is set
+4. Signing material is present (`APEX_OMNI_SEEDS` for ApeX, an account keypair
+   or EVM wallet for Paradex)
 
-`assertOrderSubmissionAllowed()` is called before any order or cancellation.
-`TRADING_MODE` defaults to paper and every other gate defaults to false.
+`assertOrderSubmissionAllowed()` and `assertParadexOrderSubmissionAllowed()`
+are called before any order or cancellation. `TRADING_MODE` defaults to paper
+and every other gate defaults to false.
 
 ### Layout
 
@@ -194,13 +259,22 @@ An order can only be submitted when **all** of these are true:
 src/exchanges/
 ├── exchange.types.ts        # normalized types + ExchangeAdapter
 ├── exchange.errors.ts
-├── exchange.factory.ts
-└── apex/
-    ├── apex.adapter.ts
-    ├── apex.client.ts
-    ├── apex.config.ts
-    ├── apex.market-mapper.ts
-    ├── apex.normalizers.ts
+├── exchange.config.ts       # environment / boolean / trading-mode parsing
+├── exchange.factory.ts      # venue selection
+├── exchange.profile.ts      # per-venue universe, pagination and env names
+├── market-universe.ts       # symbol matching + universe selection
+├── normalizers.ts           # shared OHLCV/ticker/order normalizers
+├── apex/
+│   ├── apex.adapter.ts
+│   ├── apex.client.ts
+│   ├── apex.config.ts
+│   ├── apex.market-mapper.ts
+│   └── smoke-test.ts
+└── paradex/
+    ├── paradex.adapter.ts
+    ├── paradex.client.ts
+    ├── paradex.config.ts
+    ├── paradex.market-mapper.ts
     └── smoke-test.ts
 
 src/market-data/
@@ -237,19 +311,35 @@ protection and validation are enforced in code and by the primary key.
 
 ### Data caveats
 
-- ApeX's kline endpoint returns the most recent `limit` candles ending at
-  `end`; `start` only clamps the lower edge. The backfill therefore paginates
-  backwards from the newest closed candle.
+- **ApeX pagination:** the kline endpoint returns the most recent `limit`
+  candles ending at `end`; `start` only clamps the lower edge. The backfill
+  therefore walks backwards from the newest closed candle.
+- **Paradex pagination:** klines are returned from `start_at` upwards, so the
+  backfill walks forwards in bounded windows. A short page does not stop the
+  walk because Paradex omits intervals without trades.
+- **Paradex sparse candles:** only intervals that traded are returned. The data
+  quality report counts those gaps and marks them expected instead of failing
+  the series. Downstream research must align on `openTime`, not assume a
+  contiguous array.
+- **Paradex OHLC quirk:** the interval `open` carries the previous close while
+  `high`/`low` cover trades inside the interval, so `open` can sit outside the
+  reported range. The adapter widens `high`/`low` to contain `open` and `close`
+  (both traded prices) before validation. ApeX rows stay strictly validated.
+- **Paradex market list:** the unfiltered `/markets` payload is ~16 MB because
+  it includes every option series. The adapter always requests
+  `asset_kind=PERP`, which is ~65 KB, and retries the request with backoff.
+- **Paradex timeframes:** the venue supports `1m`, `3m`, `5m`, `15m`, `30m`
+  and `1h`; other timeframes are rejected before a request is made.
 - The still-forming candle is never stored. `CandleManager` guarantees that a
   completed candle triggers evaluation exactly once, including after a restart.
 - `getTicker()` on ApeX has last price only. Use `getOrderBook()` when a bid/ask
-  is needed for execution modelling.
+  is needed for execution modelling. Paradex returns bid/ask.
 - CCXT's maker/taker values are documented defaults, not account-specific
   rates. They must be verified before being used in research PnL.
 
 ### Next step
 
-Testnet private credentials are the remaining blocker for the order-lifecycle
-phase. Until they exist, the recommended next milestones are the public
-WebSocket ingestor and candle-manager wiring, then funding rates and execution
-costs (Phase 8). Live trading stays disabled.
+Paradex account onboarding is the remaining blocker for private reads and the
+order-lifecycle phase. Until it is resolved, the recommended next milestones are
+the public WebSocket ingestor and candle-manager wiring, then funding rates and
+execution costs (Phase 8). Live trading stays disabled on both venues.

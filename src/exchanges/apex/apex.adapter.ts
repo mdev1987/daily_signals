@@ -24,7 +24,6 @@ import {
   type ApexConfig,
 } from "./apex.config";
 import {
-  apexTimeframeToMs,
   normalizeBalance,
   normalizeCandle,
   normalizeFundingRate,
@@ -33,9 +32,10 @@ import {
   normalizePosition,
   normalizeTicker,
   normalizeTrade,
-  redactApexMessage,
+  redactMessage,
+  timeframeToMs,
   type RawBalances,
-} from "./apex.normalizers";
+} from "../normalizers";
 import {
   isEligibleApexPerpetual,
   normalizeApexMarket,
@@ -127,7 +127,7 @@ export class ApexAdapter implements ExchangeAdapter {
     until?: number,
   ): Promise<Candle[]> {
     // Validates the timeframe before a request is made.
-    apexTimeframeToMs(timeframe);
+    timeframeToMs(timeframe);
 
     const requested = Math.max(
       1,
@@ -238,7 +238,11 @@ export class ApexAdapter implements ExchangeAdapter {
   /** Safe error text for logs; never includes the API key. */
   redact(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error);
-    return redactApexMessage(message, this.config.credentials.apiKey);
+    return redactMessage(message, [
+      this.config.credentials.apiKey,
+      this.config.credentials.secret,
+      this.config.credentials.seeds,
+    ]);
   }
 }
 

@@ -13,8 +13,13 @@
     "test": "bun test",
     "audit:deep": "bun run src/deep-audit.ts",
     "apex:smoke": "bun run src/exchanges/apex/smoke-test.ts",
-    "apex:markets": "bun run src/market-data/market-metadata.ts",
-    "apex:backfill": "bun run src/market-data/backfill-cli.ts"
+    "apex:markets": "EXCHANGE=apex bun run src/market-data/market-metadata.ts",
+    "apex:backfill": "EXCHANGE=apex bun run src/market-data/backfill-cli.ts",
+    "paradex:smoke": "bun run src/exchanges/paradex/smoke-test.ts",
+    "paradex:markets": "EXCHANGE=paradex bun run src/market-data/market-metadata.ts",
+    "paradex:backfill": "EXCHANGE=paradex bun run src/market-data/backfill-cli.ts",
+    "markets": "bun run src/market-data/market-metadata.ts",
+    "backfill": "bun run src/market-data/backfill-cli.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -25,10 +30,12 @@
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^5.0.0",
     "@duckdb/node-api": "^2.0.0-r.1",
+    "@paradex/sdk": "^0.9.0",
     "apexomni-connector-node": "^0.3.2-alpha.1",
     "biquote": "^0.3.0",
     "ccxt": "^4.5.93",
     "cheerio": "^1.2.0",
+    "ethers": "^6.17.0",
     "finnhub": "^2.0.16",
     "grammy": "^1.46.0",
     "telegram-markdown-v2": "^0.0.5",

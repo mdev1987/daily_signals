@@ -1,7 +1,13 @@
 import { ExchangeConfigurationError } from "../exchange.errors";
 import type { ExchangeEnvironment } from "../exchange.types";
+import {
+  readBoolean,
+  readExchangeEnvironment,
+  readTradingMode,
+  type TradingMode,
+} from "../exchange.config";
 
-export type TradingMode = "paper" | "live";
+export type { TradingMode };
 
 export interface ApexCredentials {
   apiKey: string;
@@ -30,63 +36,18 @@ export interface ApexConfig {
   credentials: ApexCredentials;
 }
 
-function readEnvironment(
-  value: string | undefined,
-  fallback: ExchangeEnvironment,
-  name: string,
-): ExchangeEnvironment {
-  const normalized = value?.trim().toLowerCase();
-
-  if (!normalized) return fallback;
-  if (normalized === "mainnet" || normalized === "prod" || normalized === "production") {
-    return "mainnet";
-  }
-  if (normalized === "testnet" || normalized === "qa" || normalized === "sandbox") {
-    return "testnet";
-  }
-
-  throw new ExchangeConfigurationError(
-    `${name} must be "mainnet" or "testnet", received "${value}"`,
-  );
-}
-
-function readBoolean(
-  value: string | undefined,
-  fallback: boolean,
-): boolean {
-  const normalized = value?.trim().toLowerCase();
-
-  if (!normalized) return fallback;
-  if (["1", "true", "yes", "on"].includes(normalized)) return true;
-  if (["0", "false", "no", "off"].includes(normalized)) return false;
-
-  return fallback;
-}
-
-export function readTradingMode(value: string | undefined): TradingMode {
-  const normalized = value?.trim().toLowerCase();
-
-  if (!normalized) return "paper";
-  if (normalized === "paper") return "paper";
-  if (normalized === "live") return "live";
-
-  throw new ExchangeConfigurationError(
-    `TRADING_MODE must be "paper" or "live", received "${value}"`,
-  );
-}
-
 export function loadApexConfig(
   env: Record<string, string | undefined> = process.env,
 ): ApexConfig {
   // APEX_ENV is the legacy single-environment switch kept for compatibility.
   const legacyEnvironment = env.APEX_ENV?.trim();
 
-  const marketDataEnvironment = readEnvironment(
+  const marketDataEnvironment = readExchangeEnvironment(
     env.APEX_MARKET_DATA_ENV ?? legacyEnvironment,
     "mainnet",
     "APEX_MARKET_DATA_ENV",
   );
-  const privateApiEnvironment = readEnvironment(
+  const privateApiEnvironment = readExchangeEnvironment(
     env.APEX_PRIVATE_API_ENV ?? legacyEnvironment,
     "mainnet",
     "APEX_PRIVATE_API_ENV",

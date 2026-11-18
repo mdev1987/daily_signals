@@ -12,10 +12,10 @@ import type {
   PositionSide,
   Ticker,
   Trade,
-} from "../exchange.types";
-import { timeframeToMs } from "../../market-data/timeframes";
+} from "./exchange.types";
+import { timeframeToMs } from "../market-data/timeframes";
 
-export { timeframeToMs as apexTimeframeToMs };
+export { timeframeToMs };
 
 function finite(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : Number(value);
@@ -29,6 +29,19 @@ function clampTimestamp(value: unknown): number | null {
 
 export type RawOhlcv = readonly (number | string | null | undefined)[];
 
+export interface NormalizeCandleOptions {
+  /**
+   * Widen `high`/`low` so they always contain `open` and `close`.
+   *
+   * Paradex carries the previous close into `open` while `high`/`low` only
+   * cover trades inside the interval, so the open can legitimately sit outside
+   * the reported range. Because open and close are both traded prices, the
+   * interval high/low cannot be tighter than them; widening is a correction,
+   * not a fabrication. Strict venues leave this disabled.
+   */
+  widenRange?: boolean;
+}
+
 /**
  * Normalizes one OHLCV row. Returns null for structurally invalid candles so
  * a single bad row cannot poison an ingestion run.
@@ -38,6 +51,7 @@ export function normalizeCandle(
   symbol: string,
   timeframe: string,
   now = Date.now(),
+  options: NormalizeCandleOptions = {},
 ): Candle | null {
   if (row.length < 6) return null;
 
@@ -61,9 +75,17 @@ export function normalizeCandle(
 
   if (open <= 0 || high <= 0 || low <= 0 || close <= 0) return null;
   if (volume < 0) return null;
-  if (high < low) return null;
-  if (high < Math.max(open, close)) return null;
-  if (low > Math.min(open, close)) return null;
+
+  const rangeHigh = options.widenRange
+    ? Math.max(high, open, close)
+    : high;
+  const rangeLow = options.widenRange
+    ? Math.min(low, open, close)
+    : low;
+
+  if (rangeHigh < rangeLow) return null;
+  if (rangeHigh < Math.max(open, close)) return null;
+  if (rangeLow > Math.min(open, close)) return null;
 
   const interval = timeframeToMs(timeframe);
 
@@ -73,8 +95,8 @@ export function normalizeCandle(
     openTime: Math.trunc(openTime),
     closeTime: Math.trunc(openTime) + interval,
     open,
-    high,
-    low,
+    high: rangeHigh,
+    low: rangeLow,
     close,
     volume,
     turnover: null,
@@ -117,7 +139,9 @@ export interface RawOrderBook {
 
 type RawOrderBookLevel = readonly (number | string | null | undefined)[];
 
-function normalizeLevels(levels: RawOrderBookLevel[] | undefined): OrderBookLevel[] {
+function normalizeLevels(
+  levels: RawOrderBookLevel[] | undefined,
+): OrderBookLevel[] {
   const result: OrderBookLevel[] = [];
 
   for (const level of levels ?? []) {
@@ -321,12 +345,23 @@ export function normalizeOrder(raw: RawOrder): Order | null {
   };
 }
 
-/** Removes accidentally echoed credentials from exchange error messages. */
-export function redactApexMessage(message: string, apiKey?: string): string {
-  let output = message.replace(/apiKey=[^\]\s,]+/gi, "apiKey=<redacted>");
+/**
+ * Removes accidentally echoed credentials from exchange error messages.
+ * Empty secrets are ignored so a missing config cannot blank the whole message.
+ */
+export function redactMessage(
+  message: string,
+  secrets: readonly (string | undefined)[] = [],
+): string {
+  let output = message.replace(
+    /(api_?key|secret|passphrase|private_?key)=[^\]\s,&]+/gi,
+    "$1=<redacted>",
+  );
 
-  if (apiKey) {
-    output = output.split(apiKey).join("<redacted>");
+  for (const secret of secrets) {
+    if (secret && secret.length >= 6) {
+      output = output.split(secret).join("<redacted>");
+    }
   }
 
   return output;

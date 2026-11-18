@@ -15,6 +15,7 @@ import {
 } from "./candle-manager";
 import { timeframeToMs } from "./timeframes";
 import type { ResearchConnection } from "../storage/database";
+import type { PaginationDirection } from "../exchanges/exchange.profile";
 
 const MAX_PAGE_SIZE = 200;
 
@@ -35,6 +36,11 @@ export interface BackfillOptions {
   /** Delay between page requests, in milliseconds. Defaults to 250. */
   requestDelayMs?: number;
   exchange?: string;
+  /**
+   * Pagination direction of the venue's kline endpoint. Defaults to
+   * `backward` for the original ApeX behaviour.
+   */
+  pagination?: PaginationDirection;
 }
 
 export type BackfillStopReason =
@@ -97,10 +103,17 @@ async function fetchPage(
 /**
  * Resumable, idempotent OHLCV backfill for one symbol/timeframe.
  *
- * ApeX's kline endpoint returns the most recent `limit` candles ending at
- * `end`; `start` only clamps the lower edge. Pagination therefore walks
- * backwards from the newest closed candle. The still-forming interval is never
- * stored, so research code cannot read an incomplete candle.
+ * Two venue pagination styles are supported:
+ *
+ * - `backward` (ApeX): the kline endpoint returns the most recent `limit`
+ *   candles ending at `end`, so the walk starts at the newest closed candle and
+ *   moves towards the past.
+ * - `forward` (Paradex): the endpoint returns candles from `start_at` upwards.
+ *   Each request asks for one bounded window and the cursor moves towards the
+ *   present, so sparse pages (intervals without trades) do not stop the walk.
+ *
+ * The still-forming interval is never stored, so research code cannot read an
+ * incomplete candle.
  */
 export async function backfillCandles(
   adapter: ExchangeAdapter,
@@ -109,6 +122,7 @@ export async function backfillCandles(
 ): Promise<BackfillResult> {
   const exchange = options.exchange ?? adapter.id;
   const timeframeMs = timeframeToMs(options.timeframe);
+  const pagination = options.pagination ?? "backward";
   const pageLimit = Math.max(
     1,
     Math.min(Math.trunc(options.pageLimit ?? MAX_PAGE_SIZE), MAX_PAGE_SIZE),
@@ -178,71 +192,124 @@ export async function backfillCandles(
     upperBound,
   );
 
-  // Exclusive end of the requested window.
-  let endExclusive = upperBound + timeframeMs;
-
   try {
-    while (endExclusive - timeframeMs >= fromAligned) {
-      const page = await fetchPage(
-        adapter,
-        options.symbol,
-        options.timeframe,
-        fromAligned,
-        pageLimit,
-        endExclusive,
-      );
-      result.requests++;
-      result.pages++;
+    if (pagination === "forward") {
+      // Exclusive end of the requested window, aligned to the last candle.
+      let windowStart = fromAligned;
 
-      const usable = page.filter(
-        (candle) =>
-          candle.openTime >= fromAligned &&
-          candle.openTime < endExclusive &&
-          candle.isFinal,
-      );
+      while (windowStart <= upperBound) {
+        const windowEnd = Math.min(
+          windowStart + pageLimit * timeframeMs,
+          upperBound + timeframeMs,
+        );
+        const page = await fetchPage(
+          adapter,
+          options.symbol,
+          options.timeframe,
+          windowStart,
+          pageLimit,
+          windowEnd,
+        );
+        result.requests++;
+        result.pages++;
 
-      result.received += usable.length;
+        const usable = page.filter(
+          (candle) =>
+            candle.openTime >= windowStart &&
+            candle.openTime < windowEnd &&
+            candle.isFinal,
+        );
 
-      if (usable.length > 0) {
-        const saved = await insertCandles(connection, exchange, usable);
-        result.inserted += saved.inserted;
-        result.updated += saved.updated;
+        result.received += usable.length;
+
+        if (usable.length > 0) {
+          const saved = await insertCandles(connection, exchange, usable);
+          result.inserted += saved.inserted;
+          result.updated += saved.updated;
+
+          await setCursor(
+            connection,
+            exchange,
+            options.symbol,
+            options.timeframe,
+            usable[usable.length - 1]!.openTime,
+          );
+        }
+
+        // Advance by the requested window, not by the last returned candle:
+        // sparse venues legitimately omit intervals without trades.
+        windowStart = windowEnd;
+
+        if (requestDelayMs > 0) await sleep(requestDelayMs);
       }
 
-      if (page.length === 0) {
-        result.stopReason = "empty-page";
-        break;
+      result.stopReason = "complete";
+    } else {
+      // Exclusive end of the requested window.
+      let endExclusive = upperBound + timeframeMs;
+
+      while (endExclusive - timeframeMs >= fromAligned) {
+        const page = await fetchPage(
+          adapter,
+          options.symbol,
+          options.timeframe,
+          fromAligned,
+          pageLimit,
+          endExclusive,
+        );
+        result.requests++;
+        result.pages++;
+
+        const usable = page.filter(
+          (candle) =>
+            candle.openTime >= fromAligned &&
+            candle.openTime < endExclusive &&
+            candle.isFinal,
+        );
+
+        result.received += usable.length;
+
+        if (usable.length > 0) {
+          const saved = await insertCandles(connection, exchange, usable);
+          result.inserted += saved.inserted;
+          result.updated += saved.updated;
+        }
+
+        if (page.length === 0) {
+          result.stopReason = "empty-page";
+          break;
+        }
+
+        const firstOpenTime = page[0]!.openTime;
+
+        if (firstOpenTime >= endExclusive) {
+          // Defensive guard: the exchange did not honour the `until` bound.
+          result.stopReason = "short-page";
+          break;
+        }
+
+        await setCursor(
+          connection,
+          exchange,
+          options.symbol,
+          options.timeframe,
+          firstOpenTime,
+        );
+
+        endExclusive = firstOpenTime;
+
+        if (endExclusive <= fromAligned) {
+          result.stopReason = "complete";
+          break;
+        }
+
+        if (page.length < pageLimit) {
+          result.stopReason = "short-page";
+          break;
+        }
+
+        if (requestDelayMs > 0) await sleep(requestDelayMs);
       }
-
-      const firstOpenTime = page[0]!.openTime;
-
-      if (firstOpenTime >= endExclusive) {
-        // Defensive guard: the exchange did not honour the `until` bound.
-        result.stopReason = "short-page";
-        break;
-      }
-
-      await setCursor(
-        connection,
-        exchange,
-        options.symbol,
-        options.timeframe,
-        firstOpenTime,
-      );
-
-      endExclusive = firstOpenTime;
-
-      if (endExclusive <= fromAligned) {
-        result.stopReason = "complete";
-        break;
-      }
-
-      if (page.length < pageLimit) {
-        result.stopReason = "short-page";
-        break;
-      }
-
-      if (requestDelayMs > 0) await sleep(requestDelayMs);
     }
 
     const finished = finish();
@@ -311,6 +378,17 @@ export interface StoredValidationSummary {
   nonFinalCandles: number;
   firstOpenTime: number | null;
   lastOpenTime: number | null;
+  /** True when gaps are expected because the venue omits untraded intervals. */
+  expectedSparse: boolean;
+}
+
+export interface StoredValidationOptions {
+  /**
+   * Venues such as Paradex only return candles for intervals that traded.
+   * With this flag, gaps are reported but do not fail the series; structural
+   * problems (invalid, duplicate, misaligned or non-final candles) still do.
+   */
+  allowSparse?: boolean;
 }
 
 export async function validateStoredSeries(
@@ -318,6 +396,7 @@ export async function validateStoredSeries(
   exchange: string,
   symbol: string,
   timeframe: string,
+  options: StoredValidationOptions = {},
 ): Promise<StoredValidationSummary> {
   const candles = await loadCandles(
     connection,
@@ -326,17 +405,24 @@ export async function validateStoredSeries(
     timeframe,
   );
   const report = validateCandles(candles, timeframeToMs(timeframe));
+  const allowSparse = options.allowSparse === true;
+  const structurallyValid =
+    report.invalid === 0 &&
+    report.duplicates === 0 &&
+    report.misaligned === 0 &&
+    report.nonFinalCandles === 0;
 
   return {
     symbol,
     timeframe,
     candles: report.total,
-    passed: report.passed,
+    passed: report.passed || (allowSparse && structurallyValid),
     invalid: report.invalid,
     duplicates: report.duplicates,
     missingIntervals: report.missingIntervals,
     nonFinalCandles: report.nonFinalCandles,
     firstOpenTime: report.firstOpenTime,
     lastOpenTime: report.lastOpenTime,
+    expectedSparse: allowSparse,
   };
 }

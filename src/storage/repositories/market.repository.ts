@@ -176,6 +176,8 @@ export async function loadMarkets(
 export async function countMarkets(
   connection: ResearchConnection,
   exchange = "apex",
+  eligibleSettle = "USDT",
+  eligibleQuote = eligibleSettle,
 ): Promise<MarketCounts> {
   const result = await connection.runAndReadAll(
     `SELECT
@@ -187,12 +189,12 @@ export async function countMarkets(
            AND linear
            AND NOT inverse
            AND contract
-           AND settle = 'USDT'
-           AND quote = 'USDT'
+           AND settle = ?
+           AND quote = ?
        ) AS eligible
      FROM markets
      WHERE exchange = ?`,
-    [exchange],
+    [eligibleSettle, eligibleQuote, exchange],
   );
 
   const row = result.getRowObjects()[0] as

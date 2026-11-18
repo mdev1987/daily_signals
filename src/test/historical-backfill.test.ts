@@ -271,4 +271,82 @@ describe("historical backfill", () => {
       (await loadCandles(database, "apex", SYMBOL, "5m")).length,
     ).toBe(2);
   });
+
+  test("forward pagination tolerates sparse candles", async () => {
+    const database = await openResearchDatabase({ path: ":memory:" });
+    const symbol = "BTC/USD:USDC";
+    const exchange = "paradex";
+    const from = LAST_OPEN - (INITIAL_COUNT - 1) * TF;
+
+    // Paradex omits intervals without trades. Skip every fifth interval so the
+    // pages are short, but the walk must still cover the whole range.
+    const dataset = Array.from({ length: INITIAL_COUNT }, (_, index) => ({
+      ...makeCandle(from + index * TF),
+      symbol,
+    })).filter((_, index) => index % 5 !== 2);
+
+    let requests = 0;
+
+    const adapter = {
+      id: exchange,
+      async getOHLCV(
+        _symbol: string,
+        _timeframe: string,
+        since?: number,
+        limit = 200,
+        until?: number,
+      ): Promise<Candle[]> {
+        requests++;
+        return dataset
+          .filter(
+            (candle) =>
+              (since === undefined || candle.openTime >= since) &&
+              (until === undefined || candle.openTime < until),
+          )
+          .slice(0, limit);
+      },
+    } as unknown as ExchangeAdapter;
+
+    const result = await backfillCandles(adapter, database, {
+      symbol,
+      timeframe: "5m",
+      from,
+      to: LAST_OPEN + TF,
+      pageLimit: 200,
+      requestDelayMs: 0,
+      pagination: "forward",
+    });
+
+    expect(result.stopReason).toBe("complete");
+    expect(result.requests).toBe(4);
+    expect(result.received).toBe(dataset.length);
+    expect(result.inserted).toBe(dataset.length);
+    expect(requests).toBe(4);
+    expect(await getLastCandleOpenTime(database, exchange, symbol, "5m")).toBe(
+      LAST_OPEN,
+    );
+
+    const strict = await validateStoredSeries(
+      database,
+      exchange,
+      symbol,
+      "5m",
+    );
+    expect(strict.passed).toBe(false);
+    expect(strict.missingIntervals).toBeGreaterThan(0);
+
+    const sparse = await validateStoredSeries(
+      database,
+      exchange,
+      symbol,
+      "5m",
+      { allowSparse: true },
+    );
+    expect(sparse.passed).toBe(true);
+    expect(sparse.expectedSparse).toBe(true);
+    expect(sparse.candles).toBe(dataset.length);
+    expect(sparse.duplicates).toBe(0);
+    expect(sparse.invalid).toBe(0);
+    expect(sparse.nonFinalCandles).toBe(0);
+  });
 });

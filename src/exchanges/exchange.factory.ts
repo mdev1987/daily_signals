@@ -1,8 +1,9 @@
-import { ExchangeConfigurationError } from "./exchange.errors";
 import type { ExchangeAdapter } from "./exchange.types";
 import { createApexAdapter } from "./apex/apex.adapter";
+import { createParadexAdapter } from "./paradex/paradex.adapter";
+import { normalizeExchangeId } from "./exchange.profile";
 
-export type ExchangeId = "apex";
+export type { ExchangeId } from "./exchange.profile";
 
 export interface ExchangeFactoryOptions {
   exchange?: string;
@@ -15,16 +16,12 @@ export interface ExchangeFactoryOptions {
 export function createExchangeAdapter(
   options: ExchangeFactoryOptions = {},
 ): ExchangeAdapter {
-  const id = (options.exchange ?? process.env.EXCHANGE ?? "apex")
-    .trim()
-    .toLowerCase();
+  const id = normalizeExchangeId(options.exchange);
 
   switch (id) {
     case "apex":
       return createApexAdapter();
-    default:
-      throw new ExchangeConfigurationError(
-        `Unsupported exchange "${id}". Available adapters: apex`,
-      );
+    case "paradex":
+      return createParadexAdapter();
   }
 }
