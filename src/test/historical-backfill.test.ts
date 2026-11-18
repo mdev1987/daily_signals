@@ -228,6 +228,36 @@ describe("historical backfill", () => {
     expect(stored[0]?.close).toBe(105);
   });
 
+  test("retries a transient page failure", async () => {
+    const database = await openResearchDatabase({ path: ":memory:" });
+    const base = createFakeExchange(5);
+    let calls = 0;
+
+    const flaky = {
+      id: "apex",
+      async getOHLCV(
+        ...args: Parameters<ExchangeAdapter["getOHLCV"]>
+      ): Promise<Candle[]> {
+        calls++;
+        if (calls === 1) throw new Error("request timed out");
+        return base.adapter.getOHLCV(...args);
+      },
+    } as unknown as ExchangeAdapter;
+
+    const from = LAST_OPEN - (5 - 1) * TF;
+    const result = await backfillCandles(flaky, database, {
+      symbol: SYMBOL,
+      timeframe: "5m",
+      from,
+      to: LAST_OPEN + TF,
+      requestDelayMs: 0,
+    });
+
+    expect(calls).toBe(2);
+    expect(result.inserted).toBe(5);
+    expect(result.stopReason).toBe("complete");
+  });
+
   test("re-inserting finalized candles is idempotent", async () => {
     const database = await openResearchDatabase({ path: ":memory:" });
     const candles = [makeCandle(LAST_OPEN - TF), makeCandle(LAST_OPEN)];

@@ -122,6 +122,10 @@ CCXT or the ApeX SDK.
 | Order placement | Blocked by three independent gates plus missing testnet keys |
 | 5-minute backfill | Working; validated against live data |
 
+A 30-day acceptance run of the default universe produced **86,400 finalized 5m
+candles across 10 markets** with zero gaps, duplicates, invalid rows, or
+in-progress candles.
+
 ### Commands
 
 ```bash

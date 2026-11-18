@@ -1,4 +1,4 @@
-import type { ExchangeAdapter } from "../exchanges/exchange.types";
+import type { Candle, ExchangeAdapter } from "../exchanges/exchange.types";
 import {
   beginIngestionRun,
   finishIngestionRun,
@@ -64,6 +64,34 @@ export interface BackfillResult {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const FETCH_ATTEMPTS = 3;
+
+async function fetchPage(
+  adapter: ExchangeAdapter,
+  symbol: string,
+  timeframe: string,
+  since: number,
+  limit: number,
+  until: number,
+): Promise<Candle[]> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await adapter.getOHLCV(symbol, timeframe, since, limit, until);
+    } catch (error) {
+      lastError = error;
+      if (attempt < FETCH_ATTEMPTS - 1) {
+        // Transient network and rate-limit failures are retried with
+        // exponential backoff. The operation is read-only, so retrying is safe.
+        await sleep(500 * 2 ** attempt);
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 /**
@@ -155,7 +183,8 @@ export async function backfillCandles(
 
   try {
     while (endExclusive - timeframeMs >= fromAligned) {
-      const page = await adapter.getOHLCV(
+      const page = await fetchPage(
+        adapter,
         options.symbol,
         options.timeframe,
         fromAligned,
