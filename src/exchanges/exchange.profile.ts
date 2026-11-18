@@ -13,10 +13,20 @@ import {
   selectInitialUniverse as selectParadexUniverse,
 } from "./paradex/paradex.market-mapper";
 import { loadParadexConfig } from "./paradex/paradex.config";
+import {
+  DEFAULT_UNIVERSE as LIGHTER_DEFAULT_UNIVERSE,
+  isEligibleLighterPerpetual,
+  selectInitialUniverse as selectLighterUniverse,
+} from "./lighter/lighter.market-mapper";
+import { loadLighterConfig } from "./lighter/lighter.config";
 
-export type ExchangeId = "apex" | "paradex";
+export type ExchangeId = "apex" | "paradex" | "lighter";
 
-export const EXCHANGE_IDS: readonly ExchangeId[] = ["apex", "paradex"];
+export const EXCHANGE_IDS: readonly ExchangeId[] = [
+  "apex",
+  "paradex",
+  "lighter",
+];
 
 /**
  * How a venue pages through historical candles:
@@ -137,9 +147,42 @@ const PARADEX_PROFILE: ExchangeProfile = {
   },
 };
 
+const LIGHTER_PROFILE: ExchangeProfile = {
+  id: "lighter",
+  label: "Lighter",
+  marketTypeLabel: "Linear USDC Perpetual",
+  eligibleSettle: "USDC",
+  eligibleQuote: "USDC",
+  defaultUniverse: LIGHTER_DEFAULT_UNIVERSE,
+  pagination: "forward",
+  // Lighter returns an empty price candle rather than omitting an interval.
+  sparseCandles: false,
+  env: {
+    symbols: "LIGHTER_SYMBOLS",
+    universeSize: "LIGHTER_UNIVERSE_SIZE",
+    timeframe: "LIGHTER_TIMEFRAME",
+    backfillDays: "LIGHTER_BACKFILL_DAYS",
+    requestDelayMs: "LIGHTER_REQUEST_DELAY_MS",
+  },
+  isEligible: isEligibleLighterPerpetual,
+  selectUniverse: selectLighterUniverse,
+  describe(env = process.env) {
+    const config = loadLighterConfig(env);
+    return {
+      environment: config.marketDataEnvironment,
+      privateApiEnabled: config.privateApiEnabled,
+      privateApiEnvironment: config.privateApiEnvironment,
+      orderSubmissionEnabled: config.orderSubmissionEnabled,
+      tradingMode: config.tradingMode,
+      liveTradingEnabled: config.liveTradingEnabled,
+    };
+  },
+};
+
 const PROFILES: Record<ExchangeId, ExchangeProfile> = {
   apex: APEX_PROFILE,
   paradex: PARADEX_PROFILE,
+  lighter: LIGHTER_PROFILE,
 };
 
 export function normalizeExchangeId(value?: string): ExchangeId {
@@ -147,7 +190,9 @@ export function normalizeExchangeId(value?: string): ExchangeId {
     .trim()
     .toLowerCase();
 
-  if (normalized === "apex" || normalized === "paradex") return normalized;
+  if (normalized === "apex" || normalized === "paradex" || normalized === "lighter") {
+    return normalized;
+  }
 
   throw new ExchangeConfigurationError(
     `Unsupported exchange "${value ?? process.env.EXCHANGE ?? ""}". ` +

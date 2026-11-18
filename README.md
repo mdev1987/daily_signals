@@ -109,23 +109,24 @@ Phase 7 operational strategy, one-week paper-trading implementation, and rewrite
 The research engine is exchange-agnostic. Strategy, risk and portfolio code
 depend only on `src/exchanges/exchange.types.ts`; nothing outside
 `src/exchanges/<venue>/` imports CCXT or a venue SDK. ApeX Omni was the first
-adapter; Paradex is the second.
+adapter, Paradex the second, Lighter the third.
 
-CCXT is the primary interface for market data and order plumbing on both
+CCXT is the primary interface for market data and order plumbing on all three
 venues. `@paradex/sdk` and `ethers` are installed for wallet/account-specific
 work (onboarding, key derivation) and are not part of the research path.
-`starknet` signs the Paradex auth request.
+`starknet` signs the Paradex auth request, and CCXT's wasm signer signs Lighter
+requests.
 
 ### Current status
 
-| Component | ApeX Omni | Paradex |
-| --- | --- | --- |
-| Public mainnet market data | Working (139 markets, 89 eligible) | Working (65 PERP markets, all eligible) |
-| Public testnet market data | Working (144 markets) | Working (25 PERP markets) |
-| Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey |
-| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account |
-| 5-minute backfill | Working; validated against live data | Working; validated against live data |
-| Settlement | USDT | USDC |
+| Component | ApeX Omni | Paradex | Lighter |
+| --- | --- | --- | --- |
+| Public mainnet market data | Working (139 markets, 89 eligible) | Working (65 PERP markets, all eligible) | Working (244 markets, 209 eligible) |
+| Public testnet market data | Working (144 markets) | Working (25 PERP markets) | Working (8 markets, 7 eligible) |
+| Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey | Blocked by mismatched credentials |
+| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account | Blocked by gates and credential mismatch |
+| 5-minute backfill | Working; validated against live data | Working; validated against live data | Working; validated against live data |
+| Settlement | USDT | USDC | USDC |
 
 A 30-day ApeX acceptance run of the default universe produced **86,400 finalized
 5m candles across 10 markets** with zero gaps, duplicates, invalid rows, or
@@ -135,7 +136,12 @@ Paradex uses unified symbols such as `BTC/USD:USDC` and keeps the native
 `BTC-USD-PERP` id in `exchangeSymbol`. A one-day smoke backfill of BTC and ETH
 stored 189 and 120 finalized candles with zero invalid or duplicate rows.
 
-### Private API status
+Lighter uses `BTC/USDC:USDC` and keeps the numeric market id (`1`) in
+`exchangeSymbol`; base-asset requests like `BTC` resolve normally. A one-day
+mainnet backfill stored **288 finalized 5m candles each for BTC and ETH**, with
+zero gaps, duplicates, invalid rows or in-progress candles.
+
+### Paradex private API status
 
 Reads work on testnet. The key in `.env` is a **subkey**, not the account's
 main key, which is why the obvious paths fail:
@@ -170,6 +176,29 @@ still needs all of its own gates plus a funded account.
 The ApeX testnet key remains a separate blocker: the supplied key is mainnet-only
 and must be recreated in the ApeX testnet portal.
 
+### Lighter private API status
+
+The account index and API key in `.env` do not belong together:
+
+- Testnet account **887** exists and holds **10,000 test USDC**.
+- Its only registered API key is index **171** (public key `cb9c…`).
+- The `.env` credentials are index **4** (public key `dd39…`).
+
+Signing with the `.env` key at index 4 returns
+`invalid auth: couldnt find account`; signing the same key at the registered
+index 171 returns `invalid signature`. The key pair is structurally valid but
+registered on a different account. `bun run lighter:account` prints the exact
+error without printing the key.
+
+To fix it, open the Lighter testnet UI for account 887 → **Settings → API Keys**,
+create a key, and copy its index, private key and public key into `.env`. Indexes
+0–3 are reserved for Lighter's own clients; automation uses 4–254, but the index
+must match the key registered on that account.
+
+Lighter also needs its signing runtime. CCXT signs with `lighter.wasm`, a 14 MB
+binary that is not committed; `bun run lighter:setup` downloads it and
+`wasm_exec.js` into `.cache/lighter/` (gitignored). Without it, private calls
+fail with a setup instruction rather than a signer stack trace.
 
 ### Commands
 
@@ -180,29 +209,37 @@ it explicitly.
 # Public market-data smoke tests (no credentials, no orders)
 bun run apex:smoke
 bun run paradex:smoke
+bun run lighter:smoke
 
-# Read-only account check on testnet (mints a JWT, reads balance/positions/orders)
+# One-time: download the Lighter wasm signer into .cache/lighter/
+bun run lighter:setup
+
+# Read-only account check (mints a token/JWT, reads balance/positions/orders)
 bun run paradex:account
+bun run lighter:account
 
-# Which endpoint accepted the key? account, subkey, or auto (default)
+# Which Paradex endpoint accepted the key? account, subkey, or auto (default)
 PARADEX_AUTH_MODE=subkey bun run paradex:account
 
 # Sync market metadata into DuckDB and print the initial universe
 bun run apex:markets
 bun run paradex:markets
+bun run lighter:markets
 
 # Backfill closed 5m candles (default: last 30 days, default majors)
 bun run apex:backfill
 bun run paradex:backfill
+bun run lighter:backfill
 
 # Explicit symbols, range and timeframe
 bun run paradex:backfill --symbols=BTC,ETH,SOL --days=7 --timeframe=5m
+bun run lighter:backfill --symbols=BTC,ETH --days=1 --timeframe=5m
 
 # Continue a partial range / refresh the tail
 bun run paradex:backfill --symbols=BTC --days=30 --timeframe=5m
 
 # Generic form, venue chosen by EXCHANGE
-EXCHANGE=paradex bun run backfill --days=1
+EXCHANGE=lighter bun run backfill --days=1
 ```
 
 The backfill is idempotent and resumable: a run whose stored range already
@@ -227,6 +264,12 @@ PARADEX_PRIVATE_API_ENV=testnet
 PARADEX_ORDER_SUBMISSION_ENABLED=false
 PARADEX_AUTH_MODE=auto
 
+LIGHTER_ENV=testnet
+LIGHTER_MARKET_DATA_ENV=testnet
+LIGHTER_PRIVATE_API_ENABLED=false
+LIGHTER_PRIVATE_API_ENV=testnet
+LIGHTER_ORDER_SUBMISSION_ENABLED=false
+
 TRADING_MODE=paper
 LIVE_TRADING_ENABLED=false
 
@@ -241,6 +284,11 @@ PARADEX_ADDRESS=
 PARADEX_WALLET_ADDRESS=
 PARADEX_EVM_PRIVATE_KEY=
 
+LIGHTER_PRIVATE_KEY=
+LIGHTER_PUBLIC_KEY=
+LIGHTER_ACCOUNT_INDEX=
+LIGHTER_KEY_INDEX=
+
 RESEARCH_DATABASE_PATH=./data/research.duckdb
 APEX_SYMBOLS=
 APEX_UNIVERSE_SIZE=10
@@ -252,11 +300,17 @@ PARADEX_UNIVERSE_SIZE=10
 PARADEX_TIMEFRAME=5m
 PARADEX_BACKFILL_DAYS=30
 PARADEX_REQUEST_DELAY_MS=250
+LIGHTER_SYMBOLS=
+LIGHTER_UNIVERSE_SIZE=10
+LIGHTER_TIMEFRAME=5m
+LIGHTER_BACKFILL_DAYS=30
+LIGHTER_REQUEST_DELAY_MS=250
 ```
 
-`APEX_SYMBOLS` and `PARADEX_SYMBOLS` accept a base asset (`BTC`), a unified
-symbol (`BTC/USD:USDC`) or a native id (`BTC-USD-PERP`). Leaving them empty
-selects the default majors that actually exist on the exchange.
+`APEX_SYMBOLS`, `PARADEX_SYMBOLS` and `LIGHTER_SYMBOLS` accept a base asset
+(`BTC`), a unified symbol (`BTC/USD:USDC` or `BTC/USDC:USDC`) or a native id
+(`BTC-USD-PERP` or `1`). Leaving them empty selects the default majors that
+actually exist on the exchange.
 
 Paradex accepts two credential shapes: the account keypair from the Paradex UI
 (`PARADEX_PRIVATE_KEY`, `PARADEX_PUBLICK_KEY`, `PARADEX_ADDRESS`) or an EVM
@@ -275,9 +329,17 @@ Read-only tokens (Settings → Key Management → Read-only) are the lowest-risk
 option for pure monitoring, but this adapter currently authenticates with the
 keypair only.
 
-`.env.example` keeps testnet for Paradex market data. The local `.env` points
-market data at mainnet while private access and execution stay on testnet, so
-research reads real candles without touching a production account.
+Lighter authenticates with an **API key pair plus two integers**, not an
+address: `LIGHTER_PRIVATE_KEY` (40-byte hex), `LIGHTER_PUBLIC_KEY`,
+`LIGHTER_ACCOUNT_INDEX` and `LIGHTER_KEY_INDEX`. Each account and sub-account
+has its own key indexes, and 0–3 are reserved for Lighter's own clients. The
+key index must match the key registered on that account; copying an index from
+one account while using another account's key fails with
+`invalid auth: couldnt find account` or `invalid signature`.
+
+`.env.example` keeps testnet for every venue. The local `.env` points market
+data at mainnet while private access and execution stay on testnet, so research
+reads real candles without touching a production account.
 
 An order can only be submitted when **all** of these are true:
 
@@ -285,11 +347,12 @@ An order can only be submitted when **all** of these are true:
 2. `TRADING_MODE=live`
 3. `LIVE_TRADING_ENABLED=true`
 4. Signing material is present (`APEX_OMNI_SEEDS` for ApeX, an account keypair
-   or EVM wallet for Paradex)
+   or EVM wallet for Paradex, an API key with both indexes for Lighter)
 
-`assertOrderSubmissionAllowed()` and `assertParadexOrderSubmissionAllowed()`
-are called before any order or cancellation. `TRADING_MODE` defaults to paper
-and every other gate defaults to false.
+`assertOrderSubmissionAllowed()`, `assertParadexOrderSubmissionAllowed()` and
+`assertLighterOrderSubmissionAllowed()` are called before any order or
+cancellation. `TRADING_MODE` defaults to paper and every other gate defaults to
+false.
 
 ### Layout
 
@@ -308,12 +371,20 @@ src/exchanges/
 │   ├── apex.config.ts
 │   ├── apex.market-mapper.ts
 │   └── smoke-test.ts
-└── paradex/
-    ├── paradex.adapter.ts
-    ├── paradex.auth.ts        # SNIP-12 auth, subkey support, JWT refresh
-    ├── paradex.client.ts
-    ├── paradex.config.ts
-    ├── paradex.market-mapper.ts
+├── paradex/
+│   ├── paradex.adapter.ts
+│   ├── paradex.auth.ts        # SNIP-12 auth, subkey support, JWT refresh
+│   ├── paradex.client.ts
+│   ├── paradex.config.ts
+│   ├── paradex.market-mapper.ts
+│   ├── account-check.ts
+│   └── smoke-test.ts
+└── lighter/
+    ├── lighter.adapter.ts
+    ├── lighter.client.ts      # CCXT client + wasm signer loading
+    ├── lighter.config.ts      # API key, account/key indexes, chain id
+    ├── lighter.market-mapper.ts
+    ├── download-signer.ts     # lighter:setup helper
     ├── account-check.ts
     └── smoke-test.ts
 
@@ -377,19 +448,41 @@ protection and validation are enforced in code and by the primary key.
 - **Paradex mainnet private API:** geo-blocked from this network
   (`GEO_IP_BLOCK`, country `IR`). Public mainnet market data still works, so
   research candles are unaffected; account reads run on testnet.
+- **Lighter pagination:** like Paradex, the candle endpoint walks forwards from
+  `start_timestamp`. It returns at most **500 candles per request**, so the
+  adapter clamps larger requests; the shared backfill pages 200 at a time.
+- **Lighter zero-volume omission:** Lighter omits zero-valued fields, so an
+  interval without trades arrives without `v`. The price candle is still real;
+  the adapter treats the missing volume as `0` instead of dropping the row.
+  Intervals themselves are contiguous (360/360 one-minute candles for a market
+  that had no trades in six hours).
+- **Lighter timeframes:** the venue supports `1m`, `5m`, `15m`, `30m`, `1h`,
+  `4h`, `12h` and `1d`; other timeframes are rejected before a request.
+- **Lighter testnet history:** short. BTC 5m candles go back about a week, so a
+  30-day request returns empty pages for the older part of the range. Use
+  mainnet for research candles.
+- **Lighter order price:** every order, including a market order, carries a
+  price — it is the worst acceptable execution price, so it cannot be omitted.
+- **Lighter funding history:** `/api/v1/fundings` reports 1h or 1d entries with
+  Unix **second** timestamps; the adapter requests 1h and converts to
+  milliseconds.
 - The still-forming candle is never stored. `CandleManager` guarantees that a
   completed candle triggers evaluation exactly once, including after a restart.
-- `getTicker()` on ApeX has last price only. Use `getOrderBook()` when a bid/ask
-  is needed for execution modelling. Paradex returns bid/ask.
+- `getTicker()` on ApeX and Lighter has last price only. Use `getOrderBook()`
+  when a bid/ask is needed for execution modelling. Paradex returns bid/ask.
 - CCXT's maker/taker values are documented defaults, not account-specific
   rates. They must be verified before being used in research PnL.
 
 ### Next step
 
+Lighter public market data is validated: 244 mainnet markets, 209 eligible, and
+a clean one-day 5m backfill for BTC and ETH. Its private reads are blocked until
+the API key and account index in `.env` come from the same account.
+
 Paradex private reads work on testnet with a subkey. The testnet account still
 needs funding before the order-lifecycle phase: it authenticates but
 `/account/summary` reports `account_value: 0` and status `UNSPECIFIED`.
 
-With reads unblocked, the recommended next milestones are the public WebSocket
-ingestor and candle-manager wiring, then funding rates and execution costs
-(Phase 8). Live trading stays disabled on both venues.
+With public ingestion stable on three venues, the recommended next milestones
+are the public WebSocket ingestor and candle-manager wiring, then funding rates
+and execution costs (Phase 8). Live trading stays disabled on all venues.

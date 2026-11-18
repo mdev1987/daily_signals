@@ -1,6 +1,7 @@
 import type { ExchangeAdapter } from "./exchange.types";
 import { createApexAdapter } from "./apex/apex.adapter";
 import { createParadexAdapter } from "./paradex/paradex.adapter";
+import { createLighterAdapter } from "./lighter/lighter.adapter";
 import { normalizeExchangeId } from "./exchange.profile";
 
 export type { ExchangeId } from "./exchange.profile";
@@ -23,5 +24,7 @@ export function createExchangeAdapter(
       return createApexAdapter();
     case "paradex":
       return createParadexAdapter();
+    case "lighter":
+      return createLighterAdapter();
   }
 }

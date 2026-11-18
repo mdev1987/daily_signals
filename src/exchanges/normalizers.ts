@@ -40,6 +40,14 @@ export interface NormalizeCandleOptions {
    * not a fabrication. Strict venues leave this disabled.
    */
   widenRange?: boolean;
+  /**
+   * Treat a missing volume as zero.
+   *
+   * Lighter omits fields whose value is zero, so an interval without trades
+   * arrives with `v` absent. The price candle is still real; dropping it would
+   * invent a gap. Only enable this for venues that document the omission.
+   */
+  zeroMissingVolume?: boolean;
 }
 
 /**
@@ -60,7 +68,8 @@ export function normalizeCandle(
   const high = finite(row[2]);
   const low = finite(row[3]);
   const close = finite(row[4]);
-  const volume = finite(row[5]);
+  const volume =
+    finite(row[5]) ?? (options.zeroMissingVolume ? 0 : null);
 
   if (
     openTime === null ||
