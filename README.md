@@ -103,3 +103,149 @@ consistency checks, and stored-report reconciliation. It does not reset or
 modify the database.
 
 Phase 7 operational strategy, one-week paper-trading implementation, and rewrite notes live in [PHASE-7-PAPER-TRADING.md](./PHASE-7-PAPER-TRADING.md).
+
+## Crypto futures research engine (ApeX Omni)
+
+ApeX Omni is the first exchange adapter for an exchange-agnostic crypto futures
+research engine. Strategy, risk and portfolio code depend only on
+`src/exchanges/exchange.types.ts`; nothing outside `src/exchanges/apex/` imports
+CCXT or the ApeX SDK.
+
+### Current status
+
+| Component | Status |
+| --- | --- |
+| Public mainnet market data | Working (139 markets, 89 eligible USDT perpetuals) |
+| Public testnet market data | Working (144 markets) |
+| Private account reads | Working on mainnet, opt-in |
+| Private testnet authentication | Blocked: the supplied key is mainnet-only |
+| Order placement | Blocked by three independent gates plus missing testnet keys |
+| 5-minute backfill | Working; validated against live data |
+
+### Commands
+
+```bash
+# Public market-data smoke test (no credentials, no orders)
+bun run apex:smoke
+
+# Sync market metadata into DuckDB and print the initial universe
+bun run apex:markets
+
+# Backfill closed 5m candles (default: last 30 days, default majors)
+bun run apex:backfill
+
+# Explicit symbols, range and timeframe
+bun run apex:backfill --symbols=BTC,ETH,SOL --days=7 --timeframe=5m
+
+# Continue a partial range / refresh the tail
+bun run apex:backfill --symbols=BTC --days=30 --timeframe=5m
+```
+
+The backfill is idempotent and resumable: a run whose stored range already
+covers the request performs no network requests. Re-walking a partial range
+upserts instead of duplicating.
+
+### Configuration
+
+Market data, private account access and execution are separate settings:
+
+```env
+APEX_MARKET_DATA_ENV=mainnet
+APEX_PRIVATE_API_ENABLED=false
+APEX_PRIVATE_API_ENV=mainnet
+APEX_ORDER_SUBMISSION_ENABLED=false
+
+TRADING_MODE=paper
+LIVE_TRADING_ENABLED=false
+
+OMNIAPEX_API_KEY=
+OMNIAPEX_API_SECRET=
+OMNIAPEX_PASS_PHRASE=
+APEX_OMNI_SEEDS=
+
+RESEARCH_DATABASE_PATH=./data/research.duckdb
+APEX_SYMBOLS=
+APEX_UNIVERSE_SIZE=10
+APEX_TIMEFRAME=5m
+APEX_BACKFILL_DAYS=30
+APEX_REQUEST_DELAY_MS=250
+```
+
+`APEX_SYMBOLS` accepts `BTC`, `BTC-USDT` or `BTC/USDT:USDT`. Leaving it empty
+selects the default majors that actually exist on the exchange.
+
+An order can only be submitted when **all** of these are true:
+
+1. `APEX_ORDER_SUBMISSION_ENABLED=true`
+2. `TRADING_MODE=live`
+3. `LIVE_TRADING_ENABLED=true`
+4. `APEX_OMNI_SEEDS` is set
+
+`assertOrderSubmissionAllowed()` is called before any order or cancellation.
+`TRADING_MODE` defaults to paper and every other gate defaults to false.
+
+### Layout
+
+```text
+src/exchanges/
+├── exchange.types.ts        # normalized types + ExchangeAdapter
+├── exchange.errors.ts
+├── exchange.factory.ts
+└── apex/
+    ├── apex.adapter.ts
+    ├── apex.client.ts
+    ├── apex.config.ts
+    ├── apex.market-mapper.ts
+    ├── apex.normalizers.ts
+    └── smoke-test.ts
+
+src/market-data/
+├── historical-backfill.ts
+├── backfill-cli.ts
+├── candle-manager.ts
+├── data-validator.ts
+├── market-metadata.ts
+└── timeframes.ts
+
+src/storage/
+├── database.ts
+└── repositories/
+    ├── market.repository.ts
+    └── candle.repository.ts
+```
+
+### Storage
+
+`research.duckdb` is separate from the Phase 7 `signals.duckdb` so a crypto
+research run cannot touch live paper-trading state.
+
+| Table | Purpose |
+| --- | --- |
+| `markets` | Contract specs, precision, limits, margin rates, raw payload |
+| `candles` | Finalized OHLCV, keyed by `(exchange, symbol, timeframe, open_time)` |
+| `ingestion_cursors` | Oldest ingested open time per series |
+| `ingestion_runs` | Per-run request/insert counters and status |
+| `schema_migrations` | Schema version |
+
+Prices are stored as `DOUBLE` because the exchange client returns JavaScript
+numbers; the source values are not higher-precision decimals. Duplicate
+protection and validation are enforced in code and by the primary key.
+
+### Data caveats
+
+- ApeX's kline endpoint returns the most recent `limit` candles ending at
+  `end`; `start` only clamps the lower edge. The backfill therefore paginates
+  backwards from the newest closed candle.
+- The still-forming candle is never stored. `CandleManager` guarantees that a
+  completed candle triggers evaluation exactly once, including after a restart.
+- `getTicker()` on ApeX has last price only. Use `getOrderBook()` when a bid/ask
+  is needed for execution modelling.
+- CCXT's maker/taker values are documented defaults, not account-specific
+  rates. They must be verified before being used in research PnL.
+
+### Next step
+
+Testnet private credentials are the remaining blocker for the order-lifecycle
+phase. Until they exist, the recommended next milestones are the public
+WebSocket ingestor and candle-manager wiring, then funding rates and execution
+costs (Phase 8). Live trading stays disabled.
