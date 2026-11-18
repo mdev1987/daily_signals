@@ -9,7 +9,7 @@ import {
   hasLighterCredentials,
   loadLighterConfig,
 } from "../exchanges/lighter/lighter.config";
-import { createLighterPrivateClient } from "../exchanges/lighter/lighter.client";
+import { createLighterPrivateClient, createLighterPublicClient } from "../exchanges/lighter/lighter.client";
 
 const CREDENTIALS = {
   LIGHTER_PRIVATE_KEY: "a".repeat(80),
@@ -29,6 +29,70 @@ describe("Lighter configuration and order safety", () => {
     expect(config.tradingMode).toBe("paper");
     expect(config.liveTradingEnabled).toBe(false);
     expect(config.chainId).toBe(300);
+    // Testnet follows the web app, where users create accounts and API keys.
+    expect(config.baseUrls.testnet).toBe("https://api.testnet.lighter.xyz");
+    expect(config.baseUrls.mainnet).toBe(
+      "https://mainnet.zklighter.elliot.ai",
+    );
+  });
+
+  test("base URLs are overridable per environment", () => {
+    const config = loadLighterConfig({
+      LIGHTER_MAINNET_BASE_URL: "https://example.test/mainnet/",
+      LIGHTER_TESTNET_BASE_URL: "https://testnet.zklighter.elliot.ai",
+    });
+
+    // Trailing slashes are stripped so URL joins stay predictable.
+    expect(config.baseUrls.mainnet).toBe("https://example.test/mainnet");
+    expect(config.baseUrls.testnet).toBe(
+      "https://testnet.zklighter.elliot.ai",
+    );
+  });
+
+  test("rejects non-HTTPS or malformed base URLs", () => {
+    for (const value of ["http://insecure.test", "not-a-url", "ftp://x.test"]) {
+      expect(() =>
+        loadLighterConfig({ LIGHTER_TESTNET_BASE_URL: value }),
+      ).toThrow(ExchangeConfigurationError);
+    }
+  });
+
+  test("clients use the base URL of their own environment", () => {
+    const publicClient = createLighterPublicClient(
+      loadLighterConfig({ LIGHTER_MARKET_DATA_ENV: "mainnet" }),
+    );
+    expect(
+      (publicClient.urls as unknown as { api: { public: string } }).api.public,
+    ).toBe("https://mainnet.zklighter.elliot.ai");
+
+    const testnetClient = createLighterPublicClient(loadLighterConfig({}));
+    expect(
+      (testnetClient.urls as unknown as { api: { public: string } }).api.public,
+    ).toBe("https://api.testnet.lighter.xyz");
+
+    const privateClient = createLighterPrivateClient(
+      loadLighterConfig({
+        ...CREDENTIALS,
+        LIGHTER_PRIVATE_API_ENABLED: "true",
+        LIGHTER_TESTNET_BASE_URL: "https://testnet.zklighter.elliot.ai",
+      }),
+    );
+    expect(
+      (privateClient.urls as unknown as { api: { private: string } }).api
+        .private,
+    ).toBe("https://testnet.zklighter.elliot.ai");
+  });
+
+  test("an explicit chain id survives sandbox mode", () => {
+    const client = createLighterPrivateClient(
+      loadLighterConfig({
+        ...CREDENTIALS,
+        LIGHTER_PRIVATE_API_ENABLED: "true",
+        LIGHTER_CHAIN_ID: "304",
+      }),
+    );
+
+    expect((client.options as Record<string, unknown>).chainId).toBe(304);
   });
 
   test("separates market data, private API and execution environments", () => {

@@ -1,5 +1,8 @@
 import type { MarketInterface } from "ccxt";
-import { UnsupportedOperationError } from "../exchange.errors";
+import {
+  ExchangeConfigurationError,
+  UnsupportedOperationError,
+} from "../exchange.errors";
 import type {
   BalanceEntry,
   Candle,
@@ -37,6 +40,7 @@ import {
   assertLighterOrderSubmissionAllowed,
   loadLighterConfig,
   type LighterConfig,
+  type LighterMarginMode,
 } from "./lighter.config";
 import {
   isEligibleLighterPerpetual,
@@ -353,16 +357,41 @@ export class LighterAdapter implements ExchangeAdapter {
     await (await this.getPrivateClient()).cancelOrder(orderId, symbol);
   }
 
+  /**
+   * Sets the account's leverage for one market. Lighter stores the initial
+   * margin fraction per account and market, so this is a signed transaction
+   * rather than a local setting.
+   */
+  async setLeverage(
+    symbol: string,
+    leverage: number,
+    marginMode: LighterMarginMode,
+  ): Promise<void> {
+    assertLighterOrderSubmissionAllowed(this.config);
+
+    if (!Number.isInteger(leverage) || leverage < 1) {
+      throw new ExchangeConfigurationError(
+        `Lighter leverage must be a positive integer, received "${leverage}"`,
+      );
+    }
+
+    await (await this.getPrivateClient()).setLeverage(leverage, symbol, {
+      marginMode,
+    });
+  }
+
   /** Non-secret identity of the private client, once it is ready. */
   getAuthInfo(): {
     accountIndex: number | null;
     apiKeyIndex: number | null;
     chainId: number;
+    baseUrl: string;
   } {
     return {
       accountIndex: this.config.credentials.accountIndex,
       apiKeyIndex: this.config.credentials.apiKeyIndex,
       chainId: this.config.chainId,
+      baseUrl: this.config.baseUrls[this.config.privateApiEnvironment],
     };
   }
 

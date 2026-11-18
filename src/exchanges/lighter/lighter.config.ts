@@ -27,6 +27,29 @@ export interface LighterCredentials {
   apiKeyIndex: number | null;
 }
 
+export type LighterMarginMode = "cross" | "isolated";
+
+/**
+ * Futures execution settings. The paper-trading engine remains the source of
+ * truth; this config only controls whether its positions are mirrored onto a
+ * Lighter account and with which margin.
+ */
+export interface LighterExecutionConfig {
+  /** Mirror paper positions to Lighter. Requires every order gate plus this. */
+  enabled: boolean;
+  /** Account-wide leverage per market, e.g. 5 for 5x. */
+  leverage: number;
+  marginMode: LighterMarginMode;
+  /** Base symbols that the bot may trade on Lighter, e.g. ["BTC","ETH","SOL"]. */
+  symbols: readonly string[];
+  /** Extra tolerance over the best price when signing a market order. */
+  worstPriceSlippagePct: number;
+  /** Testnet is the default; mainnet needs an explicit opt-in. */
+  allowMainnetExecution: boolean;
+  /** How often venue positions are reconciled against paper positions. */
+  reconcileIntervalMs: number;
+}
+
 export interface LighterConfig {
   /** Environment used for public market data (prices, candles, order books). */
   marketDataEnvironment: ExchangeEnvironment;
@@ -49,6 +72,18 @@ export interface LighterConfig {
   wasmExecPath: string;
   /** Chain id the signer uses. 304 mainnet, 300 testnet. */
   chainId: number;
+  /**
+   * REST base URL per environment.
+   *
+   * Lighter runs more than one deployment. The web app at
+   * `testnet.app.lighter.xyz` talks to `api.testnet.lighter.xyz`, while the
+   * docs reference API is `testnet.zklighter.elliot.ai`. Accounts, balances
+   * and API keys do not carry over between them, so the host must match the
+   * one the key was created on.
+   */
+  baseUrls: Record<ExchangeEnvironment, string>;
+  /** Leverage and mirroring of paper positions onto the account. */
+  execution: LighterExecutionConfig;
 }
 
 /** Lighter's own web and mobile clients reserve these API key indexes. */
@@ -56,6 +91,16 @@ const RESERVED_API_KEY_INDEXES = new Set([0, 1, 2, 3]);
 
 const DEFAULT_LIBRARY_PATH = ".cache/lighter/lighter.wasm";
 const DEFAULT_WASM_EXEC_PATH = ".cache/lighter/wasm_exec.js";
+
+/**
+ * The testnet default follows the web app, because that is where users create
+ * accounts and API keys. The docs reference deployment is still reachable and
+ * can be selected with `LIGHTER_TESTNET_BASE_URL`.
+ */
+export const DEFAULT_BASE_URLS: Record<ExchangeEnvironment, string> = {
+  mainnet: "https://mainnet.zklighter.elliot.ai",
+  testnet: "https://api.testnet.lighter.xyz",
+};
 
 function chainIdFor(environment: ExchangeEnvironment): number {
   return environment === "mainnet" ? 304 : 300;
@@ -75,6 +120,36 @@ function readInteger(
   }
 
   return Number(normalized);
+}
+
+/**
+ * Signed requests carry an auth token, so the base URL must be HTTPS. A plain
+ * HTTP override is rejected instead of silently sending a token in clear text.
+ */
+function readBaseUrl(
+  value: string | undefined,
+  fallback: string,
+  name: string,
+): string {
+  const normalized = value?.trim();
+  if (!normalized) return fallback;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new ExchangeConfigurationError(
+      `${name} must be an absolute URL, received "${normalized}"`,
+    );
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new ExchangeConfigurationError(
+      `${name} must use https, received "${normalized}"`,
+    );
+  }
+
+  return normalized.replace(/\/+$/, "");
 }
 
 function readCredentials(
@@ -118,6 +193,113 @@ function readCredentials(
   return { apiKey, publicKey, accountIndex, apiKeyIndex };
 }
 
+/**
+ * Lighter testnet currently lists three perpetuals. Restricting the default
+ * mirror set to them keeps every executable paper position tradable; a paper
+ * signal on anything else stays paper-only.
+ */
+export const DEFAULT_EXECUTION_SYMBOLS = ["BTC", "ETH", "SOL"] as const;
+
+function readDecimal(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+): number {
+  const normalized = value?.trim();
+  if (!normalized) return fallback;
+
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed)) {
+    throw new ExchangeConfigurationError(
+      `${name} must be a finite number, received "${normalized}"`,
+    );
+  }
+
+  return parsed;
+}
+
+function readMarginMode(value: string | undefined): LighterMarginMode {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return "cross";
+  if (normalized === "cross" || normalized === "isolated") return normalized;
+
+  throw new ExchangeConfigurationError(
+    `LIGHTER_MARGIN_MODE must be "cross" or "isolated", received "${value}"`,
+  );
+}
+
+function readExecutionSymbols(value: string | undefined): string[] {
+  const normalized = value?.trim();
+  if (!normalized) return [...DEFAULT_EXECUTION_SYMBOLS];
+
+  const symbols = normalized
+    .split(",")
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter((symbol) => symbol.length > 0);
+
+  if (symbols.length === 0) {
+    throw new ExchangeConfigurationError(
+      "LIGHTER_EXECUTION_SYMBOLS must list at least one base symbol",
+    );
+  }
+
+  for (const symbol of symbols) {
+    if (!/^[A-Z0-9]+$/.test(symbol)) {
+      throw new ExchangeConfigurationError(
+        `LIGHTER_EXECUTION_SYMBOLS contains an invalid base symbol "${symbol}"`,
+      );
+    }
+  }
+
+  return [...new Set(symbols)];
+}
+
+function readExecutionConfig(
+  env: Record<string, string | undefined>,
+): LighterExecutionConfig {
+  const leverage = readDecimal(env.LIGHTER_LEVERAGE, 5, "LIGHTER_LEVERAGE");
+  if (!Number.isInteger(leverage) || leverage < 1 || leverage > 50) {
+    throw new ExchangeConfigurationError(
+      `LIGHTER_LEVERAGE must be an integer between 1 and 50, received "${leverage}"`,
+    );
+  }
+
+  const worstPriceSlippagePct = readDecimal(
+    env.LIGHTER_WORST_PRICE_SLIPPAGE_PCT,
+    1,
+    "LIGHTER_WORST_PRICE_SLIPPAGE_PCT",
+  );
+  if (worstPriceSlippagePct < 0 || worstPriceSlippagePct > 10) {
+    throw new ExchangeConfigurationError(
+      "LIGHTER_WORST_PRICE_SLIPPAGE_PCT must be between 0 and 10",
+    );
+  }
+
+  const reconcileIntervalMs = readDecimal(
+    env.LIGHTER_RECONCILE_INTERVAL_MS,
+    60_000,
+    "LIGHTER_RECONCILE_INTERVAL_MS",
+  );
+  if (reconcileIntervalMs < 5_000) {
+    throw new ExchangeConfigurationError(
+      "LIGHTER_RECONCILE_INTERVAL_MS must be at least 5000",
+    );
+  }
+
+  return {
+    enabled: readBoolean(env.LIGHTER_EXECUTION_ENABLED, false),
+    leverage,
+    marginMode: readMarginMode(env.LIGHTER_MARGIN_MODE),
+    symbols: readExecutionSymbols(env.LIGHTER_EXECUTION_SYMBOLS),
+    worstPriceSlippagePct,
+    allowMainnetExecution: readBoolean(
+      env.LIGHTER_ALLOW_MAINNET_EXECUTION,
+      false,
+    ),
+    reconcileIntervalMs,
+  };
+}
+
 export function loadLighterConfig(
   env: Record<string, string | undefined> = process.env,
 ): LighterConfig {
@@ -146,6 +328,19 @@ export function loadLighterConfig(
     libraryPath: resolve(env.LIGHTER_LIBRARY_PATH ?? DEFAULT_LIBRARY_PATH),
     wasmExecPath: resolve(env.LIGHTER_WASM_EXEC_PATH ?? DEFAULT_WASM_EXEC_PATH),
     chainId: readInteger(env.LIGHTER_CHAIN_ID, "LIGHTER_CHAIN_ID") ?? chainIdFor(privateApiEnvironment),
+    baseUrls: {
+      mainnet: readBaseUrl(
+        env.LIGHTER_MAINNET_BASE_URL,
+        DEFAULT_BASE_URLS.mainnet,
+        "LIGHTER_MAINNET_BASE_URL",
+      ),
+      testnet: readBaseUrl(
+        env.LIGHTER_TESTNET_BASE_URL,
+        DEFAULT_BASE_URLS.testnet,
+        "LIGHTER_TESTNET_BASE_URL",
+      ),
+    },
+    execution: readExecutionConfig(env),
   };
 }
 
@@ -187,6 +382,43 @@ export function assertLighterOrderSubmissionAllowed(
   }
 }
 
+/**
+ * Extra gate for mirroring paper positions onto the venue. It reuses every
+ * order-submission check and then enforces the execution-specific guards. The
+ * default environment is testnet; a mainnet run needs a deliberate opt-in.
+ */
+export function assertLighterExecutionAllowed(config: LighterConfig): void {
+  if (!config.execution.enabled) {
+    throw new ExchangeConfigurationError(
+      "Lighter execution is disabled (LIGHTER_EXECUTION_ENABLED=false)",
+    );
+  }
+
+  assertLighterOrderSubmissionAllowed(config);
+
+  if (!config.privateApiEnabled) {
+    throw new ExchangeConfigurationError(
+      "Lighter execution requires LIGHTER_PRIVATE_API_ENABLED=true",
+    );
+  }
+
+  if (
+    config.privateApiEnvironment !== "testnet" &&
+    !config.execution.allowMainnetExecution
+  ) {
+    throw new ExchangeConfigurationError(
+      "Lighter execution is restricted to testnet. Set " +
+        "LIGHTER_ALLOW_MAINNET_EXECUTION=true to trade a funded mainnet account.",
+    );
+  }
+
+  if (config.execution.symbols.length === 0) {
+    throw new ExchangeConfigurationError(
+      "Lighter execution needs at least one symbol in LIGHTER_EXECUTION_SYMBOLS",
+    );
+  }
+}
+
 /** Configuration summary with secrets removed. */
 export function describeLighterConfig(config: LighterConfig) {
   const { accountIndex, apiKeyIndex, apiKey, publicKey } = config.credentials;
@@ -204,7 +436,9 @@ export function describeLighterConfig(config: LighterConfig) {
     accountIndex,
     apiKeyIndex,
     chainId: config.chainId,
+    baseUrls: config.baseUrls,
     libraryPath: config.libraryPath,
     wasmExecPath: config.wasmExecPath,
+    execution: config.execution,
   };
 }

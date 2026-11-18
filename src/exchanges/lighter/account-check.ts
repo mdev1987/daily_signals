@@ -33,6 +33,7 @@ async function main(): Promise<void> {
     console.log(`Account index:   ${auth.accountIndex ?? "n/a"}`);
     console.log(`API key index:   ${auth.apiKeyIndex ?? "n/a"}`);
     console.log(`Chain id:        ${auth.chainId}`);
+    console.log(`Private base:    ${auth.baseUrl}`);
 
     // Sequential on purpose: the first call loads the wasm signer and mints the
     // auth token that the following calls reuse.

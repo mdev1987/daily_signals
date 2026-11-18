@@ -58,6 +58,19 @@ export async function loadLighterMarkets(
 }
 
 /**
+ * Points every CCXT URL scope at one deployment. Lighter runs separate
+ * deployments (the web app's `api.testnet.lighter.xyz` and the docs'
+ * `testnet.zklighter.elliot.ai`), and an account only exists on one of them.
+ */
+function applyBaseUrl(client: LighterClient, baseUrl: string): void {
+  client.urls["api"] = {
+    root: baseUrl,
+    public: baseUrl,
+    private: baseUrl,
+  };
+}
+
+/**
  * Public client for market data. Credentials are deliberately omitted so a
  * market-data run can never perform a signed request.
  */
@@ -69,6 +82,8 @@ export function createLighterPublicClient(
   if (config.marketDataEnvironment === "testnet") {
     client.setSandboxMode(true);
   }
+
+  applyBaseUrl(client, config.baseUrls[config.marketDataEnvironment]);
 
   return client;
 }
@@ -118,6 +133,11 @@ export function createLighterPrivateClient(
   if (config.privateApiEnvironment === "testnet") {
     client.setSandboxMode(true);
   }
+
+  // `setSandboxMode()` rewrites the chain id to 300/304, so apply the explicit
+  // value afterwards; then point the client at the matching deployment.
+  client.options.chainId = config.chainId;
+  applyBaseUrl(client, config.baseUrls[config.privateApiEnvironment]);
 
   return client;
 }

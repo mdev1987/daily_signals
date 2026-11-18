@@ -80,6 +80,72 @@ function validatePhase7Config(): void {
 type Direction = "long" | "short";
 type DbRow = Record<string, unknown>;
 
+/** Minimal position shape handed to the venue bridge. */
+export interface PaperPositionSnapshot {
+  id: string;
+  symbol: string;
+  direction: Direction;
+  quantity: number;
+  entryPrice: number;
+  notional: number;
+}
+
+/**
+ * Optional venue mirror. Methods are synchronous because execution is queued
+ * by the bridge; the paper engine must never wait on a network round trip.
+ */
+export interface PaperExecutionSink {
+  onOpen(position: PaperPositionSnapshot): void;
+  onClose(position: PaperPositionSnapshot, exitReason: string): void;
+  reconcile(openPositions: PaperPositionSnapshot[]): void;
+}
+
+let executionSink: PaperExecutionSink | null = null;
+
+/** Registers (or clears) the venue bridge. Disabled by default. */
+export function setPaperExecutionSink(sink: PaperExecutionSink | null): void {
+  executionSink = sink;
+}
+
+function snapshot(position: DbRow): PaperPositionSnapshot {
+  return {
+    id: String(position.id),
+    symbol: String(position.symbol),
+    direction: String(position.direction) as Direction,
+    quantity: asNumber(position.quantity),
+    entryPrice: asNumber(position.entry_price),
+    notional: asNumber(position.notional),
+  };
+}
+
+function notifyOpen(position: PaperPositionSnapshot): void {
+  if (!executionSink) return;
+  try {
+    executionSink.onOpen(position);
+  } catch (error) {
+    console.warn(`[PAPER] Execution open notification failed: ${String(error)}`);
+  }
+}
+
+function notifyClose(position: PaperPositionSnapshot, exitReason: string): void {
+  if (!executionSink) return;
+  try {
+    executionSink.onClose(position, exitReason);
+  } catch (error) {
+    console.warn(`[PAPER] Execution close notification failed: ${String(error)}`);
+  }
+}
+
+async function notifyReconcile(connection: DatabaseConnection): Promise<void> {
+  if (!executionSink) return;
+  const open = await rows(connection, "SELECT * FROM paper_positions WHERE status = 'OPEN'");
+  try {
+    executionSink.reconcile(open.map(snapshot));
+  } catch (error) {
+    console.warn(`[PAPER] Execution reconcile notification failed: ${String(error)}`);
+  }
+}
+
 export function signalDirection(signal: string): Direction | null {
   if (signal === "BUY" || signal === "STRONG_BUY") return "long";
   if (signal === "SELL" || signal === "STRONG_SELL") return "short";
@@ -330,6 +396,10 @@ async function closePosition(
     `[PAPER] CLOSE ${position.symbol} ${direction.toUpperCase()} | ${exitReason} | net $${net.toFixed(2)}`,
   );
 
+  // The venue mirror runs after the paper trade is committed. A failure here
+  // is logged by the bridge and must never roll back the simulation.
+  notifyClose(snapshot(position), exitReason);
+
   const reportMd =
     `💥 **Phase 7 Paper Trading** — Position Closed\n\n` +
     `🏷 **Symbol** · \`${String(position.symbol)}\`\n` +
@@ -521,6 +591,8 @@ async function processPendingEntries(connection: DatabaseConnection): Promise<vo
       ? 1 + PHASE7_CONFIG.takeProfitPct / 100
       : 1 - PHASE7_CONFIG.takeProfitPct / 100);
 
+    const positionId = crypto.randomUUID();
+
     await connection.run("BEGIN TRANSACTION");
     try {
       await connection.run(`
@@ -529,7 +601,7 @@ async function processPendingEntries(connection: DatabaseConnection): Promise<vo
          notional, quantity, entry_fee, entry_slippage, stop_price, target_price,
          last_checked_price_time, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
-      `, [crypto.randomUUID(), symbol, timeframe, direction, signal, Date.now(),
+      `, [positionId, symbol, timeframe, direction, signal, Date.now(),
         entryPrice, notional, quantity, entryFee, entrySlippage, stopPrice, targetPrice, quote.closeTime]);
       await connection.run("DELETE FROM paper_pending_entries WHERE symbol = ? AND primary_timeframe = ?", [symbol, timeframe]);
       await connection.run("COMMIT");
@@ -538,6 +610,15 @@ async function processPendingEntries(connection: DatabaseConnection): Promise<vo
       throw error;
     }
     console.log(`[PAPER] OPEN ${symbol} ${direction.toUpperCase()} via ${timeframe} | entry ${entryPrice} | notional $${notional.toFixed(2)}`);
+
+    notifyOpen({
+      id: positionId,
+      symbol,
+      direction,
+      quantity,
+      entryPrice,
+      notional,
+    });
     const openMd =
       `🚀 **Phase 7 Paper Trading** — Position Opened\n\n` +
       `🏷 **Symbol** · \`${symbol}\`\n` +
@@ -794,6 +875,7 @@ async function runPaperTradingCycleUnlocked(
   await closeOnStops(connection);
   await closeOnPrimaryReversals(connection);
   await processPendingEntries(connection);
+  await notifyReconcile(connection);
 }
 
 export function runPaperTradingCycle(
@@ -823,6 +905,7 @@ export function runPaperTradingPriceCycle(
     await closeOnStops(connection);
     await closeOnPrimaryReversals(connection);
     await processPendingEntries(connection);
+    await notifyReconcile(connection);
   });
 }
 

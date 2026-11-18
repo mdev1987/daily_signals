@@ -2,16 +2,28 @@ import { mkdir, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { loadLighterConfig } from "./lighter.config";
 
+/**
+ * CCXT keeps the signer binaries it is tested against in its repository. The
+ * separate `ccxt/lighter-wasm` mirror lags behind: its binary predates the
+ * 48-bit market indexes that Lighter testnet uses (4095+), so signing a
+ * testnet order fails with "MarketIndex is not valid". Always take the
+ * binaries from the CCXT tree that matches the installed CCXT version.
+ */
+const CCXT_BINARIES =
+  "https://raw.githubusercontent.com/ccxt/ccxt/master/ts/src/test/static/binaries";
+
 const SIGNER_FILES = [
   {
     label: "lighter.wasm",
-    url: "https://raw.githubusercontent.com/ccxt/lighter-wasm/main/lighter.wasm",
+    url: `${CCXT_BINARIES}/lighter-signer.wasm`,
     env: "LIGHTER_LIBRARY_PATH",
+    minBytes: 1_000_000,
   },
   {
     label: "wasm_exec.js",
-    url: "https://raw.githubusercontent.com/ccxt/lighter-wasm/main/wasm_exec.js",
+    url: `${CCXT_BINARIES}/wasm_exec.js`,
     env: "LIGHTER_WASM_EXEC_PATH",
+    minBytes: 1_000,
   },
 ] as const;
 
@@ -35,11 +47,16 @@ async function main(): Promise<void> {
   for (const target of targets) {
     if (!force) {
       const existing = await stat(target.path).catch(() => null);
-      if (existing?.isFile() && existing.size > 0) {
+      if (existing?.isFile() && existing.size >= target.minBytes) {
         console.log(
           `  ${target.label}: present (${existing.size} bytes) -> ${target.path}`,
         );
         continue;
+      }
+      if (existing?.isFile()) {
+        console.log(
+          `  ${target.label}: cached file is too small (${existing.size} bytes), re-downloading`,
+        );
       }
     }
 
@@ -53,8 +70,11 @@ async function main(): Promise<void> {
     }
 
     const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength === 0) {
-      throw new Error(`${target.label} download was empty`);
+    if (bytes.byteLength < target.minBytes) {
+      throw new Error(
+        `${target.label} download is truncated: ${bytes.byteLength} bytes ` +
+          `(expected at least ${target.minBytes})`,
+      );
     }
 
     await mkdir(dirname(target.path), { recursive: true });

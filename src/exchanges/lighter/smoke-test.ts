@@ -29,6 +29,9 @@ async function main(): Promise<void> {
 
     console.log(`Markets loaded:      ${markets.length}`);
     console.log(`Eligible perpetuals: ${eligible.length}`);
+    console.log(
+      `Base URL:            ${config.baseUrls[config.marketDataEnvironment]}`,
+    );
     console.log(`Server time:         ${new Date(serverTime).toISOString()}`);
     console.log(`Clock offset:        ${serverTime - Date.now()} ms`);
 

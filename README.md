@@ -123,8 +123,8 @@ requests.
 | --- | --- | --- | --- |
 | Public mainnet market data | Working (139 markets, 89 eligible) | Working (65 PERP markets, all eligible) | Working (244 markets, 209 eligible) |
 | Public testnet market data | Working (144 markets) | Working (25 PERP markets) | Working (8 markets, 7 eligible) |
-| Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey | Blocked by mismatched credentials |
-| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account | Blocked by gates and credential mismatch |
+| Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey | Working on testnet (web-app deployment, 10,000 test USDC) |
+| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account | Working on testnet: leveraged market orders and reduce-only closes |
 | 5-minute backfill | Working; validated against live data | Working; validated against live data | Working; validated against live data |
 | Settlement | USDT | USDC | USDC |
 
@@ -178,27 +178,66 @@ and must be recreated in the ApeX testnet portal.
 
 ### Lighter private API status
 
-The account index and API key in `.env` do not belong together:
+Reads work on testnet. The cause of the earlier failures was a **deployment
+mismatch**, not the key itself:
 
-- Testnet account **887** exists and holds **10,000 test USDC**.
-- Its only registered API key is index **171** (public key `cb9c…`).
-- The `.env` credentials are index **4** (public key `dd39…`).
+- The web app (`testnet.app.lighter.xyz`) talks to `api.testnet.lighter.xyz`.
+- The docs reference API is `testnet.zklighter.elliot.ai`.
+- Accounts, balances and API keys exist on only one of them. A key created in
+  the web app is invisible to the docs host, which reports
+  `couldnt find account` or `invalid signature`.
 
-Signing with the `.env` key at index 4 returns
-`invalid auth: couldnt find account`; signing the same key at the registered
-index 171 returns `invalid signature`. The key pair is structurally valid but
-registered on a different account. `bun run lighter:account` prints the exact
-error without printing the key.
+`.env` therefore pins `LIGHTER_TESTNET_BASE_URL=https://api.testnet.lighter.xyz`
+and uses the sub-account `281474976710647` created in the web app. `bun run
+lighter:account` reads 10,000 test USDC, zero positions and zero open orders.
 
-To fix it, open the Lighter testnet UI for account 887 → **Settings → API Keys**,
-create a key, and copy its index, private key and public key into `.env`. Indexes
-0–3 are reserved for Lighter's own clients; automation uses 4–254, but the index
-must match the key registered on that account.
+The same rule applies to every check: `apikeys` and `nextNonce` must be queried
+on the host that matches the key. `LIGHTER_MAINNET_BASE_URL` and
+`LIGHTER_TESTNET_BASE_URL` override either side, and both are validated as
+absolute HTTPS URLs at startup.
 
 Lighter also needs its signing runtime. CCXT signs with `lighter.wasm`, a 14 MB
 binary that is not committed; `bun run lighter:setup` downloads it and
 `wasm_exec.js` into `.cache/lighter/` (gitignored). Without it, private calls
 fail with a setup instruction rather than a signer stack trace.
+
+Take both files from `ccxt/ccxt` (`ts/src/test/static/binaries`), which is what
+`lighter:setup` now does. The older `ccxt/lighter-wasm` mirror ships a signer
+that predates Lighter's 48-bit market indexes, so signing a testnet order fails
+with `MarketIndex is not valid` even though account reads work. The testnet
+perpetuals use ids `4095` (ETH), `4096` (BTC) and `4097` (SOL).
+
+### Lighter futures execution
+
+`LIGHTER_EXECUTION_ENABLED=true` mirrors Phase 7 paper positions onto the
+configured Lighter account. Paper trading remains authoritative:
+
+- A confirmed paper entry becomes a **market order** (`buy` for long, `sell`
+  for short) with the configured `LIGHTER_LEVERAGE` and `LIGHTER_MARGIN_MODE`.
+  The position size matches the paper quantity; leverage only reduces the
+  margin reserved by the venue.
+- A paper exit becomes a **reduce-only** market order, so a duplicated close
+  can never flip the position.
+- `LIGHTER_EXECUTION_SYMBOLS` limits mirroring to markets the venue lists.
+  Lighter testnet has BTC, ETH and SOL; every other paper symbol stays
+  simulation-only.
+- A queued reconciler closes venue positions that no longer exist in the paper
+  book, which covers a crash between the paper commit and the venue order.
+
+Lighter signs a worst acceptable price into every order, including market
+orders. The bridge uses the best quote on the relevant side plus
+`LIGHTER_WORST_PRICE_SLIPPAGE_PCT`, falling back to the other side and then the
+last trade, because the testnet book is often one-sided.
+
+All order gates still apply: `TRADING_MODE=live`, `LIVE_TRADING_ENABLED=true`,
+`LIGHTER_ORDER_SUBMISSION_ENABLED=true` and `LIGHTER_EXECUTION_ENABLED=true`.
+Execution is restricted to the testnet private API; mainnet needs
+`LIGHTER_ALLOW_MAINNET_EXECUTION=true`. Every order and error is written to the
+`lighter_executions` audit trail.
+
+Testnet liquidity is thin: the book often has only one side, so a market entry
+can be acknowledged and then cancel unfilled. The bridge logs that outcome and
+the reconciler keeps retrying closes; it never silently reports a fill.
 
 ### Commands
 
@@ -213,6 +252,9 @@ bun run lighter:smoke
 
 # One-time: download the Lighter wasm signer into .cache/lighter/
 bun run lighter:setup
+
+# Replace a stale or truncated signer (required for testnet market ids 4095+)
+LIGHTER_SIGNER_FORCE=1 bun run lighter:setup
 
 # Read-only account check (mints a token/JWT, reads balance/positions/orders)
 bun run paradex:account
@@ -269,6 +311,16 @@ LIGHTER_MARKET_DATA_ENV=testnet
 LIGHTER_PRIVATE_API_ENABLED=false
 LIGHTER_PRIVATE_API_ENV=testnet
 LIGHTER_ORDER_SUBMISSION_ENABLED=false
+LIGHTER_MAINNET_BASE_URL=https://mainnet.zklighter.elliot.ai
+LIGHTER_TESTNET_BASE_URL=https://api.testnet.lighter.xyz
+
+LIGHTER_EXECUTION_ENABLED=false
+LIGHTER_LEVERAGE=5
+LIGHTER_MARGIN_MODE=cross
+LIGHTER_EXECUTION_SYMBOLS=BTC,ETH,SOL
+LIGHTER_WORST_PRICE_SLIPPAGE_PCT=1
+LIGHTER_ALLOW_MAINNET_EXECUTION=false
+LIGHTER_RECONCILE_INTERVAL_MS=60000
 
 TRADING_MODE=paper
 LIVE_TRADING_ENABLED=false
@@ -461,6 +513,12 @@ protection and validation are enforced in code and by the primary key.
 - **Lighter testnet history:** short. BTC 5m candles go back about a week, so a
   30-day request returns empty pages for the older part of the range. Use
   mainnet for research candles.
+- **Lighter deployments:** the web app (`testnet.app.lighter.xyz`) uses
+  `api.testnet.lighter.xyz`, while the docs reference API is
+  `testnet.zklighter.elliot.ai`. They are separate environments: the same
+  account index can exist on both with different owners and keys. Point
+  `LIGHTER_MAINNET_BASE_URL` / `LIGHTER_TESTNET_BASE_URL` at the host where the
+  key was created, and query `apikeys` and `nextNonce` on that same host.
 - **Lighter order price:** every order, including a market order, carries a
   price — it is the worst acceptable execution price, so it cannot be omitted.
 - **Lighter funding history:** `/api/v1/fundings` reports 1h or 1d entries with
@@ -476,8 +534,8 @@ protection and validation are enforced in code and by the primary key.
 ### Next step
 
 Lighter public market data is validated: 244 mainnet markets, 209 eligible, and
-a clean one-day 5m backfill for BTC and ETH. Its private reads are blocked until
-the API key and account index in `.env` come from the same account.
+a clean one-day 5m backfill for BTC and ETH. Private reads now work on testnet,
+with 10,000 test USDC, after pointing the client at the web app's API host.
 
 Paradex private reads work on testnet with a subkey. The testnet account still
 needs funding before the order-lifecycle phase: it authenticates but

@@ -18,7 +18,14 @@ import {
 } from "./database";
 import { runPriceCollector } from "./price-collector";
 import { notifyStartup, telegram } from "./telegram";
-import { initializePaperTrading, runPaperTradingCycle, logPaperTradingStatus } from "./paper-trading";
+import {
+  initializePaperTrading,
+  runPaperTradingCycle,
+  logPaperTradingStatus,
+  setPaperExecutionSink,
+} from "./paper-trading";
+import { loadLighterConfig } from "./exchanges/lighter/lighter.config";
+import { LighterExecutionBridge } from "./exchanges/lighter/lighter.execution";
 
 const connection = await openDatabase();
 const stopCollector = new AbortController();
@@ -210,6 +217,44 @@ async function runCycle(): Promise<void> {
   }
 }
 
+/**
+ * Starts the optional Lighter futures mirror. A configuration or connection
+ * failure leaves the bot in paper-only mode instead of stopping signal
+ * ingestion, but the failure is reported loudly.
+ */
+async function startLighterExecution(): Promise<LighterExecutionBridge | null> {
+  const config = loadLighterConfig();
+
+  if (!config.execution.enabled) {
+    console.log(" Lighter futures execution: disabled");
+    return null;
+  }
+
+  const bridge = new LighterExecutionBridge({ connection, config });
+
+  try {
+    await bridge.connect();
+    setPaperExecutionSink(bridge);
+    console.log(
+      ` Lighter futures execution: ${config.execution.leverage}x ` +
+        `${config.execution.marginMode} on ${config.privateApiEnvironment} ` +
+        `(${config.execution.symbols.join(", ")})`,
+    );
+    return bridge;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      `[EXEC] Lighter execution unavailable, staying paper-only: ${message}`,
+    );
+    void telegram(
+      `# ⚠️ Lighter Execution Disabled\n\n` +
+        `**Reason:** ${message}\n\n` +
+        `Paper trading continues without venue orders.`,
+    );
+    return null;
+  }
+}
+
 async function main(): Promise<void> {
   console.log("==================================");
   console.log(" Live Daily Signals Receiver");
@@ -233,6 +278,8 @@ async function main(): Promise<void> {
 
   await initializePaperTrading(connection);
 
+  const execution = await startLighterExecution();
+
   // Runs independently from the signal cycle and writes through the same
   // serialized database queue.
   const priceTask = runPriceCollector(connection, stopCollector.signal);
@@ -244,6 +291,8 @@ async function main(): Promise<void> {
   } finally {
     stopCollector.abort();
     await priceTask;
+    await execution?.close();
+    setPaperExecutionSink(null);
     connection.disconnectSync();
     console.log("[ENGINE] Database connection closed.");
   }

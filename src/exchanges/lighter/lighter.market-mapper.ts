@@ -162,3 +162,63 @@ export function selectInitialUniverse(
     limit,
   );
 }
+
+const USD_QUOTES = new Set(["USD", "USDC", "USDT"]);
+
+/**
+ * Maps a signal-side or canonical symbol (`BTC/USD`, `BTCUSD`, `BTC`) to the
+ * Lighter USDC perpetual the bot may trade. Anything outside the caller's
+ * allow-list returns null so the position stays paper-only instead of being
+ * forced onto the wrong contract.
+ */
+export function toLighterPerpetualSymbol(
+  symbol: string,
+  supportedBases: readonly string[],
+): string | null {
+  const normalized = symbol.trim().toUpperCase().replace(/\s+/g, "");
+  if (!normalized) return null;
+
+  const allowed = new Set(
+    supportedBases.map((base) => base.trim().toUpperCase()).filter(Boolean),
+  );
+  const parts = normalized.split(/[/:_-]/).filter(Boolean);
+
+  let base = parts[0] ?? "";
+
+  if (parts.length >= 2) {
+    const quote = parts[parts.length - 1]!;
+    if (!USD_QUOTES.has(quote)) return null;
+  } else {
+    for (const suffix of ["USDC", "USDT", "USD"]) {
+      if (base.endsWith(suffix) && base.length > suffix.length) {
+        base = base.slice(0, -suffix.length);
+        break;
+      }
+    }
+  }
+
+  if (!base || !allowed.has(base)) return null;
+
+  return `${base}/USDC:USDC`;
+}
+
+/**
+ * Floors a base quantity to the market's amount step. Lighter rejects orders
+ * with more decimals than the market supports, so rounding down is the only
+ * safe direction for an opening order.
+ */
+export function floorToAmountStep(
+  quantity: number,
+  step: number | null,
+): number {
+  if (!Number.isFinite(quantity) || quantity <= 0) return 0;
+  if (step === null || !Number.isFinite(step) || step <= 0) return quantity;
+
+  const decimals = Math.max(
+    0,
+    Math.min(12, Math.round(-Math.log10(step))),
+  );
+  const factor = 10 ** decimals;
+
+  return Math.floor(quantity * factor) / factor;
+}
