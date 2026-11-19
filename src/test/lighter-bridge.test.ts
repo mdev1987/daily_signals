@@ -37,6 +37,16 @@ interface FakeOptions {
   closeError?: boolean;
   /** Return a rejected order without closing anything. */
   closeReject?: boolean;
+  /** Status to report on a reduce-only order (e.g. "canceled"). */
+  closeStatus?: string;
+  /** Make close orders for one symbol only throw. */
+  closeErrorSymbol?: string;
+  /** Make the position endpoint throw after the entry order was submitted. */
+  positionsErrorAfterSubmit?: boolean;
+  /** Add the venue position, then throw as if the acknowledgement was lost. */
+  createOrderError?: boolean;
+  /** Hook used to inspect state at the moment the order is submitted. */
+  beforeOrder?: () => Promise<void>;
 }
 
 function fakeAdapter(opts: FakeOptions = {}) {
@@ -61,6 +71,12 @@ function fakeAdapter(opts: FakeOptions = {}) {
     }),
     getMarkets: async () => [
       { symbol: SYMBOL, amountStep: 0.0001, minAmount: 0.0002, minCost: 10 },
+      {
+        symbol: "ETH/USDC:USDC",
+        amountStep: 0.0001,
+        minAmount: 0.0002,
+        minCost: 10,
+      },
     ],
     getBalance: async () =>
       opts.balanceAvailable === false
@@ -74,15 +90,27 @@ function fakeAdapter(opts: FakeOptions = {}) {
     }),
     getTicker: async () => ({ last: 100_005 }),
     getOpenOrders: async () => opts.openOrders ?? [],
-    getPositions: async () => adapter.positions,
+    getPositions: async () => {
+      if (opts.positionsErrorAfterSubmit && orders.length > 0) {
+        throw new Error("position endpoint unavailable");
+      }
+      return adapter.positions;
+    },
     setLeverage: async () => {
       if (opts.leverageError) throw new Error("leverage rejected");
     },
     createOrder: async (req: any) => {
+      if (opts.beforeOrder) await opts.beforeOrder();
       orders.push(req);
 
       if (req.reduceOnly) {
-        if (opts.closeError) throw new Error("close order rejected");
+        if (
+          opts.closeError ||
+          (opts.closeErrorSymbol !== undefined &&
+            req.symbol === opts.closeErrorSymbol)
+        ) {
+          throw new Error("close order rejected");
+        }
 
         const target = req.side === "sell" ? "long" : "short";
         const ratio = opts.closeReject ? 0 : (opts.closeFillRatio ?? 1);
@@ -115,7 +143,8 @@ function fakeAdapter(opts: FakeOptions = {}) {
           amount: req.amount,
           filled,
           remaining: req.amount - filled,
-          status: opts.closeReject ? "rejected" : "closed",
+          status:
+            opts.closeStatus ?? (opts.closeReject ? "rejected" : "closed"),
           timestamp: null,
           raw: null,
         };
@@ -133,6 +162,11 @@ function fakeAdapter(opts: FakeOptions = {}) {
           unrealizedPnl: 0,
         },
       ];
+
+      // The order can be accepted by the venue while the response is lost.
+      if (opts.createOrderError) {
+        throw new Error("order acknowledgement lost");
+      }
 
       return {
         id: `o${orders.length}`,
@@ -157,16 +191,17 @@ function fakeAdapter(opts: FakeOptions = {}) {
 async function makeBridge(adapter: any, env: Record<string, string> = {}) {
   const instance = await DuckDBInstance.create(":memory:");
   const connection = await instance.connect();
+  const logs: string[] = [];
   const bridge = new LighterExecutionBridge({
     connection: connection as any,
     config: loadLighterConfig({ ...ENV, ...env }),
     adapter: adapter as LighterAdapter,
     stopLossPct: 2,
-    log: () => {},
+    log: (message) => logs.push(message),
     sleep: async () => {},
   });
   await (bridge as any).ensureAuditTable();
-  return { bridge, connection };
+  return { bridge, connection, logs };
 }
 
 const paper = (
@@ -453,11 +488,20 @@ describe("Lighter bridge shutdown and leverage guard", () => {
 
 async function ownershipOf(connection: any, id = "p1") {
   const result = await connection.runAndReadAll(
-    "SELECT status, filled_amount, closed_amount FROM lighter_owned_positions WHERE paper_position_id = ?",
+    `SELECT status, confirmation, filled_amount, closed_amount,
+            bot_closed_amount, external_closed_amount
+     FROM lighter_owned_positions WHERE paper_position_id = ?`,
     [id],
   );
   return result.getRowObjects()[0] as
-    | { status: string; filled_amount: number; closed_amount: number }
+    | {
+        status: string;
+        confirmation: string;
+        filled_amount: number;
+        closed_amount: number;
+        bot_closed_amount: number;
+        external_closed_amount: number;
+      }
     | undefined;
 }
 
@@ -621,5 +665,239 @@ describe("Lighter bridge failure handling", () => {
 
     expect(a.orders).toHaveLength(1);
     expect((await ownershipOf(connection))?.status).toBe("OPEN");
+  });
+});
+
+const ethPaper = (): PaperExecutionPosition =>
+  paper({
+    id: "p2",
+    symbol: "ETH/USD",
+    entryPrice: 3_000,
+    quantity: 0.01,
+    notional: 30,
+  });
+
+describe("Lighter bridge durable entry intent", () => {
+  test("the intent is durable before the order leaves the process", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    let atSubmission: any = null;
+    a.options.beforeOrder = async () => {
+      atSubmission = await ownershipOf(connection);
+    };
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(atSubmission).toMatchObject({
+      status: "PENDING",
+      confirmation: "INTENT",
+      filled_amount: 0,
+    });
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "OPEN",
+      confirmation: "CONFIRMED",
+    });
+  });
+
+  test("an unverifiable entry keeps a PENDING row that reconcile adopts", async () => {
+    const a = fakeAdapter({ positionsErrorAfterSubmit: true });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(a.orders).toHaveLength(1);
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "PENDING",
+      confirmation: "UNRESOLVED",
+      filled_amount: 0,
+    });
+
+    // The endpoint recovers; reconcile adopts the fill from the venue.
+    a.options.positionsErrorAfterSubmit = false;
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    const row = await ownershipOf(connection);
+    expect(row?.status).toBe("OPEN");
+    expect(row?.confirmation).toBe("CONFIRMED");
+    expect(row?.filled_amount).toBeCloseTo(0.001, 9);
+    expect(a.orders).toHaveLength(1);
+  });
+
+  test("a lost acknowledgement is adopted from the venue", async () => {
+    const a = fakeAdapter({ createOrderError: true });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(a.positions).toHaveLength(1);
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "PENDING",
+      confirmation: "UNRESOLVED",
+    });
+
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    const row = await ownershipOf(connection);
+    expect(row?.status).toBe("OPEN");
+    expect(row?.filled_amount).toBeCloseTo(0.001, 9);
+  });
+
+  test("reconcile closes an intent the venue never filled", async () => {
+    const a = fakeAdapter({ createOrderError: true, fillRatio: 0 });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    expect((await ownershipOf(connection))?.status).toBe("PENDING");
+
+    bridge.reconcile([]);
+    await bridge.flush();
+
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "CLOSED",
+      confirmation: "FAILED",
+      filled_amount: 0,
+      closed_amount: 0,
+    });
+  });
+
+  test("reconcile leaves a pending intent alone while an order works", async () => {
+    const a = fakeAdapter({ createOrderError: true, fillRatio: 0 });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.options.openOrders = [{ symbol: SYMBOL, side: "buy", amount: 0.001 }];
+    bridge.reconcile([]);
+    await bridge.flush();
+
+    expect((await ownershipOf(connection))?.status).toBe("PENDING");
+    expect(a.orders).toHaveLength(1);
+  });
+});
+
+describe("Lighter bridge failure attribution", () => {
+  test("a canceled close with a partial fill is PARTIALLY_FILLED", async () => {
+    const a = fakeAdapter({ closeFillRatio: 0.5, closeStatus: "canceled" });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    bridge.onClose(paper(), "STOP_LOSS");
+    await bridge.flush();
+
+    const rows = await connection.runAndReadAll(
+      "SELECT status, filled_amount FROM lighter_executions WHERE action = 'CLOSE'",
+    );
+    expect(rows.getRowObjects()[0]?.status).toBe("PARTIALLY_FILLED");
+
+    const row = await ownershipOf(connection);
+    expect(row?.status).toBe("OPEN");
+    expect(row?.bot_closed_amount).toBeCloseTo(0.0005, 9);
+    expect(row?.external_closed_amount).toBe(0);
+  });
+
+  test("a position closed outside the bot is attributed as external", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.positions = [];
+    bridge.reconcile([]);
+    await bridge.flush();
+
+    expect(a.orders).toHaveLength(1);
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "CLOSED",
+      bot_closed_amount: 0,
+    });
+    expect((await ownershipOf(connection))?.external_closed_amount).toBeCloseTo(
+      0.001,
+      9,
+    );
+  });
+
+  test("a thrown unwind logs the unresolved leverage alert", async () => {
+    const a = fakeAdapter({ reportedLeverage: 25, closeError: true });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect((await ownershipOf(connection))?.status).toBe("UNWIND_PENDING");
+    expect(logs.join("\n")).toContain("leverage mismatch is UNRESOLVED");
+  });
+
+  test("shutdown adopts and closes a pending entry that filled", async () => {
+    const a = fakeAdapter({ positionsErrorAfterSubmit: true });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    expect((await ownershipOf(connection))?.status).toBe("PENDING");
+
+    // The endpoint recovers only at shutdown time.
+    a.options.positionsErrorAfterSubmit = false;
+    await bridge.close();
+
+    expect(a.positions).toHaveLength(0);
+    expect(a.orders).toHaveLength(2);
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+  });
+
+  test("shutdown reports a pending entry it cannot resolve", async () => {
+    const a = fakeAdapter({ positionsErrorAfterSubmit: true });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    await bridge.close();
+
+    expect((await ownershipOf(connection))?.status).toBe("PENDING");
+    const text = logs.join("\n");
+    expect(text).toContain("could not resolve pending intent");
+    expect(text).toContain("pending entry");
+    expect(text).toContain("shutdown left bot-owned positions open");
+  });
+
+  test("shutdown keeps flattening other positions when one close throws", async () => {
+    const a = fakeAdapter({ closeErrorSymbol: SYMBOL });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    bridge.onOpen(ethPaper());
+    await bridge.flush();
+
+    await bridge.close();
+
+    // BTC: one entry plus three failed close attempts. ETH: entry plus close.
+    expect(a.orders).toHaveLength(6);
+    expect(
+      a.positions.filter((position: any) => position.symbol === SYMBOL),
+    ).toHaveLength(1);
+    expect(
+      a.positions.filter(
+        (position: any) => position.symbol === "ETH/USDC:USDC",
+      ),
+    ).toHaveLength(0);
+    expect(a.closed).toBe(true);
+
+    expect((await ownershipOf(connection, "p1"))?.status).toBe("OPEN");
+    expect((await ownershipOf(connection, "p2"))?.status).toBe("CLOSED");
+
+    const text = logs.join("\n");
+    expect(text).toContain("attempt 1/3 failed");
+    expect(text).toContain("could not flatten BTC/USDC:USDC");
+    expect(text).toContain("shutdown left bot-owned positions open");
   });
 });

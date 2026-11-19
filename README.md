@@ -581,26 +581,46 @@ and execution costs (Phase 8). Live trading stays disabled on all venues.
 The bot never closes a position it cannot prove it opened. `lighter_owned_positions`
 is the registry, keyed by `paper_position_id`:
 
-- An entry is recorded only after the venue confirms a fill. Opens are refused
-  when the market already has a position or a resting order, so a size that
-  appears immediately afterwards is attributable to the bot's order.
+- A durable entry intent is written **before** the order is submitted. If the
+  process or the database dies after the venue accepts the order, the row still
+  exists. Confirmation is tracked separately from ownership
+  (`INTENT` → `ACKNOWLEDGED` → `CONFIRMED`, or `UNRESOLVED` / `FAILED`).
+- The fill is claimed only from an observed venue position. If that read fails,
+  or the acknowledgement is lost, the row stays `PENDING` with
+  `confirmation = UNRESOLVED`; the next reconcile adopts the venue position
+  (sized from the venue, priced from its entry price) instead of discarding the
+  trail. A `PENDING` intent with no position and no working order is closed as
+  never filled.
+- Opens are refused when the market already has a position or a resting order,
+  so a size that appears after an intent is attributable to the bot's order.
 - A fill of zero (thin testnet book) is stored as `UNVERIFIED`. The bridge will
   not close an `UNVERIFIED` or missing record, and reconcile treats the venue
   position as external.
 - `CLOSE` and `RECONCILE_CLOSE` send at most the bot-owned remaining size. If the
   venue position is larger, the excess is left untouched; if its side does not
   match the owned side, the close is refused.
+- Closed size is attributed: `bot_closed_amount` is what this bot's reduce-only
+  orders measured as filled, `external_closed_amount` is size found flat on the
+  venue without a bot order (manual close, another process). `closed_amount` is
+  their sum, so execution statistics do not mistake a manual close for a bot
+  fill.
 - Each execution row records requested, filled, remaining and average price plus
-  the order id / transaction hash (`lighter_executions`).
+  the order id / transaction hash (`lighter_executions`). A close is classified
+  from the measured fill first, so a canceled or expired order with a partial
+  fill is `PARTIALLY_FILLED`, not `REJECTED`.
 - The reconciler walks symbols from the registry as well as the config, so
   removing a symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand an owned
   position.
 - On a clean shutdown, `LIGHTER_FLATTEN_ON_SHUTDOWN=true` re-reads each owned
   position and retries a reduce-only close up to three times before the client
-  disconnects. Any residual position is logged as an error with its symbol and
-  size; a shutdown that could not flatten does not claim success. `SIGKILL`,
-  machine failure and network loss cannot run this policy, which is why
-  exchange-side stops are still required.
+  disconnects. A thrown order, price or position error counts as a failed
+  attempt and does not stop the remaining attempts or the other owned
+  positions. Pending entry intents are resolved from the venue first, so an
+  unconfirmed fill is still flattened, and an intent that cannot be resolved is
+  reported as a pending entry rather than assumed flat. Any residual position is
+  logged as an error with its symbol and size; a shutdown that could not
+  flatten does not claim success. `SIGKILL`, machine failure and network loss
+  cannot run this policy, which is why exchange-side stops are still required.
 - At week end, every paper position is liquidated even without a fresh quote
   (last stored candle, then entry price), so the mirror is not left open.
 

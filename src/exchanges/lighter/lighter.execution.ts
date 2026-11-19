@@ -44,25 +44,57 @@ export type ExecutionAction =
   | "SKIPPED";
 
 /**
- * What the bot believes it owns on the venue, keyed by the paper position that
- * caused it. A venue position is never closed unless a matching `OPEN` row
- * exists here with a positive remaining size.
+ * Ownership lifecycle of a venue position, keyed by the paper position that
+ * caused it. A venue position is never closed unless a matching `OPEN` or
+ * `UNWIND_PENDING` row exists here with a positive remaining size.
+ *
+ * PENDING        = entry intent is durable, but the venue has not been observed
+ *                  to confirm the fill yet (submitted, acknowledgement lost, or
+ *                  the position endpoint was unavailable). Reconcile resolves it.
+ * OPEN           = fill observed and manageable.
+ * UNWIND_PENDING = a risk check failed after the fill; reconcile must close it
+ *                  even while paper still shows the position as open.
+ * UNVERIFIED     = the order was acknowledged but no fill was observed, so the
+ *                  bridge will not claim the position.
+ * CLOSED         = no remaining owned size.
  */
+export type OwnershipStatus =
+  | "PENDING"
+  | "OPEN"
+  | "UNWIND_PENDING"
+  | "UNVERIFIED"
+  | "CLOSED";
+
+/**
+ * How far the entry got. Kept separate from `status` so a lost acknowledgement
+ * or a failed position read is visible without discarding the ownership trail.
+ */
+export type EntryConfirmation =
+  | "INTENT"
+  | "ACKNOWLEDGED"
+  | "CONFIRMED"
+  | "FAILED"
+  | "UNRESOLVED";
+
+/** Who removed the owned size: this bot, or a manual/external action. */
+export type CloseAttribution = "BOT" | "EXTERNAL";
+
 export interface OwnedVenuePosition {
   paperPositionId: string;
   symbol: string;
   side: "long" | "short";
   requestedAmount: number;
   filledAmount: number;
+  /** botClosedAmount + externalClosedAmount. */
   closedAmount: number;
+  /** Quantity this bot closed with its own reduce-only orders. */
+  botClosedAmount: number;
+  /** Quantity found flat on the venue without a bot close order. */
+  externalClosedAmount: number;
   averagePrice: number | null;
   orderId: string | null;
-  /**
-   * OPEN = verified and manageable. UNVERIFIED = never claim it.
-   * UNWIND_PENDING = a risk check failed after the fill; reconcile must close
-   * it even while paper still shows the position as open.
-   */
-  status: "OPEN" | "CLOSED" | "UNVERIFIED" | "UNWIND_PENDING";
+  status: OwnershipStatus;
+  confirmation: EntryConfirmation;
 }
 
 /** Amounts below this are treated as fully closed (venue size steps). */
@@ -277,10 +309,12 @@ export class LighterExecutionBridge {
         const residual = await this.flattenOwned("SHUTDOWN_CLOSE");
         if (residual.length > 0) {
           const detail = residual
-            .map(
-              (entry) =>
-                `${entry.symbol} ${entry.side} ` +
-                `${entry.filledAmount - entry.closedAmount}`,
+            .map((entry) =>
+              entry.status === "PENDING"
+                ? `${entry.symbol} ${entry.side} pending entry ` +
+                  `(order ${entry.orderId ?? "unknown"})`
+                : `${entry.symbol} ${entry.side} ` +
+                  `${entry.filledAmount - entry.closedAmount}`,
             )
             .join(", ");
           this.log(
@@ -447,32 +481,100 @@ export class LighterExecutionBridge {
         return;
       }
 
-      const order = await this.adapter.createOrder({
+      // Durable entry intent before the order leaves the process. If the
+      // process or the database dies after the venue accepts the entry, this
+      // row is what lets reconcile match venue state; ownership is never
+      // inferred from a position that appears without an intent.
+      await this.recordOwnership({
+        paperPositionId: position.id,
         symbol,
-        type: "market",
-        side,
-        amount,
-        price,
+        side: position.direction,
+        requestedAmount: amount,
+        filledAmount: 0,
+        closedAmount: 0,
+        botClosedAmount: 0,
+        externalClosedAmount: 0,
+        averagePrice: price,
+        orderId: null,
+        status: "PENDING",
+        confirmation: "INTENT",
+        now: this.now(),
       });
 
+      let order: Order;
+      try {
+        order = await this.adapter.createOrder({
+          symbol,
+          type: "market",
+          side,
+          amount,
+          price,
+        });
+      } catch (error) {
+        // The signed order may have reached the venue even though the call
+        // failed. Keep the intent visible so reconcile can check the market
+        // instead of dropping the trail.
+        await this.setEntryConfirmation(position.id, "UNRESOLVED");
+        throw error;
+      }
+
       const reference = orderReference(order);
-      const confirmation = await this.verifyOpen(
-        symbol,
-        position.direction,
-        amount,
-      );
+      await this.acknowledgeOwnership(position.id, reference);
+
+      let verification: {
+        filled: number;
+        entryPrice: number | null;
+        leverage: number | null;
+      } | null = null;
+      try {
+        verification = await this.verifyOpen(
+          symbol,
+          position.direction,
+          amount,
+        );
+      } catch (error) {
+        // A fill is only claimed from an observed venue position. Without that
+        // read the intent stays PENDING and reconcile adopts the position when
+        // the endpoint recovers.
+        await this.setEntryConfirmation(position.id, "UNRESOLVED");
+        this.log(
+          `[EXEC] WARN ${symbol} order ${reference ?? "?"} was acknowledged but ` +
+            `could not be verified (${this.adapter.redact(error)}); ` +
+            `ownership stays PENDING for reconcile`,
+        );
+      }
+
+      if (!verification) {
+        await this.record({
+          paperPositionId: position.id,
+          action: "OPEN",
+          symbol,
+          side,
+          amount,
+          price,
+          orderId: reference,
+          status: "SUBMITTED",
+          requestedAmount: amount,
+          filledAmount:
+            order.filled !== null && order.filled > 0 ? order.filled : 0,
+          remainingAmount:
+            amount - (order.filled !== null && order.filled > 0 ? order.filled : 0),
+          averagePrice: order.average ?? null,
+          txHash: reference,
+        });
+        return;
+      }
+
       const reportedFill =
         order.filled !== null && Number.isFinite(order.filled) && order.filled > 0
           ? order.filled
           : 0;
       const filled = Math.min(
         amount,
-        Math.max(reportedFill, confirmation.filled),
+        Math.max(reportedFill, verification.filled),
       );
-      const averagePrice = confirmation.entryPrice ?? order.price ?? price;
+      const averagePrice = verification.entryPrice ?? order.price ?? price;
 
-      // Claim the fill before any other risk check runs. If the unwind below
-      // fails, the ownership row is what lets reconcile finish the job.
       await this.record({
         paperPositionId: position.id,
         action: "OPEN",
@@ -496,9 +598,12 @@ export class LighterExecutionBridge {
         requestedAmount: amount,
         filledAmount: filled,
         closedAmount: 0,
+        botClosedAmount: 0,
+        externalClosedAmount: 0,
         averagePrice,
         orderId: reference,
         status: filled > OWNERSHIP_EPSILON ? "OPEN" : "UNVERIFIED",
+        confirmation: "CONFIRMED",
         now: this.now(),
       });
 
@@ -513,7 +618,7 @@ export class LighterExecutionBridge {
       // margin fraction. If it exceeds the configured value the liquidation
       // guard no longer holds, so unwind immediately. Ownership only becomes
       // CLOSED once the venue confirms the position is flat.
-      const actualLeverage = confirmation.leverage;
+      const actualLeverage = verification.leverage;
       if (
         actualLeverage !== null &&
         actualLeverage > this.config.execution.leverage * 1.01
@@ -532,41 +637,69 @@ export class LighterExecutionBridge {
         );
 
         if (filled > OWNERSHIP_EPSILON) {
-          await this.markOwnershipStatus(position.id, "UNWIND_PENDING");
-
-          // Each attempt re-reads the venue position and advances ownership by
-          // the confirmed fill only. If the venue stays exposed, the row stays
-          // UNWIND_PENDING so reconcile retries it even while paper is open.
-          let remaining = filled;
-          for (let attempt = 1; attempt <= 2; attempt++) {
-            const outcome = await this.closeOwned({
-              paperPositionId: position.id,
-              symbol,
-              ownedSide: position.direction,
-              amount: remaining,
-              reason: "LEVERAGE_MISMATCH",
-              action: "CLOSE",
+          // The row is already OPEN from the confirmed fill. A failure to mark
+          // it pending must not skip the unwind or the alert below.
+          await this
+            .markOwnershipStatus(position.id, "UNWIND_PENDING")
+            .catch((error) => {
+              this.log(
+                `[EXEC] ERROR ${symbol} could not mark ownership UNWIND_PENDING: ` +
+                  `${this.adapter.redact(error)}`,
+              );
             });
 
-            if (outcome.filled > OWNERSHIP_EPSILON) {
-              await this.addOwnershipClosed(position.id, outcome.filled);
-            }
+          // Each attempt re-reads the venue position and advances ownership by
+          // the confirmed fill only. A thrown order or price error is caught
+          // here so the remaining attempts still run and the alert below is
+          // always emitted.
+          let remaining = filled;
+          let unresolvedReason = `${remaining} still open`;
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+              const outcome = await this.closeOwned({
+                paperPositionId: position.id,
+                symbol,
+                ownedSide: position.direction,
+                amount: remaining,
+                reason: "LEVERAGE_MISMATCH",
+                action: "CLOSE",
+              });
 
-            remaining = outcome.remaining;
-            if (remaining <= OWNERSHIP_EPSILON) {
-              await this.markOwnershipClosed(position.id, "CLOSE");
+              if (outcome.filled > OWNERSHIP_EPSILON) {
+                await this.addOwnershipClosed(
+                  position.id,
+                  outcome.filled,
+                  "BOT",
+                );
+              }
+
+              remaining = outcome.remaining;
+              if (remaining <= OWNERSHIP_EPSILON) {
+                await this.markOwnershipClosed(position.id, "CLOSE", "BOT");
+                this.log(
+                  `[EXEC] ${symbol} leverage mismatch unwound on attempt ${attempt}`,
+                );
+                return;
+              }
+
+              unresolvedReason = `${remaining} still open`;
+            } catch (error) {
+              unresolvedReason =
+                `attempt ${attempt} threw: ${this.adapter.redact(error)}`;
               this.log(
-                `[EXEC] ${symbol} leverage mismatch unwound on attempt ${attempt}`,
+                `[EXEC] ERROR ${symbol} leverage mismatch unwind attempt ` +
+                  `${attempt} failed: ${this.adapter.redact(error)}`,
               );
-              return;
             }
 
             if (attempt < 2) await this.sleep(DEFAULT_SLEEP_MS);
           }
 
+          // Unconditional, whether the last attempt returned a residual size
+          // or threw: the venue is still exposed at the wrong leverage.
           this.log(
             `[EXEC] ERROR ${symbol} leverage mismatch is UNRESOLVED ` +
-              `(${remaining} still open at ${actualLeverage.toFixed(2)}x); ` +
+              `(${unresolvedReason} at ${actualLeverage.toFixed(2)}x); ` +
               `ownership stays UNWIND_PENDING and reconcile will retry`,
           );
           return;
@@ -652,7 +785,9 @@ export class LighterExecutionBridge {
             "CLOSE",
           );
         } else {
-          await this.markOwnershipClosed(position.id, "CLOSE");
+          // The venue is flat but no close order was sent: the size left
+          // through a manual action or another process.
+          await this.markOwnershipClosed(position.id, "CLOSE", "EXTERNAL");
           await this.skip(
             position,
             symbol,
@@ -689,10 +824,10 @@ export class LighterExecutionBridge {
 
       // Advance ownership only by the amount the venue actually closed.
       if (outcome.filled > OWNERSHIP_EPSILON) {
-        await this.addOwnershipClosed(position.id, outcome.filled);
+        await this.addOwnershipClosed(position.id, outcome.filled, "BOT");
       }
       if (outcome.remaining <= OWNERSHIP_EPSILON) {
-        await this.markOwnershipClosed(position.id, "CLOSE");
+        await this.markOwnershipClosed(position.id, "CLOSE", "BOT");
       }
     } catch (error) {
       await this.recordFailure(position.id, "CLOSE", symbol, side, amount, price, error);
@@ -700,11 +835,70 @@ export class LighterExecutionBridge {
     }
   }
 
+  /**
+   * Resolves one durable entry intent from venue state.
+   *
+   * ADOPTED  = the venue holds a position; ownership is claimed at the venue
+   *            size. WORKING = no position but a resting order, keep waiting.
+   * UNFILLED = no position and no order, the entry never happened.
+   * DUPLICATE = another owned row already claims this side.
+   *
+   * Throws when the venue cannot be read, so the caller keeps the intent
+   * PENDING instead of discarding the trail.
+   */
+  private async resolvePendingOwnership(
+    entry: OwnedVenuePosition,
+    venue: Position[],
+    claimedByAnother: boolean,
+  ): Promise<{
+    row: OwnedVenuePosition | null;
+    outcome: "ADOPTED" | "WORKING" | "UNFILLED" | "DUPLICATE";
+  }> {
+    const held = venue.find(
+      (position) =>
+        position.side === entry.side &&
+        Math.abs(position.contracts) > OWNERSHIP_EPSILON,
+    );
+
+    if (held) {
+      if (claimedByAnother) {
+        await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
+        await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
+        return { row: null, outcome: "DUPLICATE" };
+      }
+
+      const size = Math.abs(held.contracts);
+      const entryPrice = Number.isFinite(held.entryPrice)
+        ? held.entryPrice
+        : entry.averagePrice;
+      await this.adoptOwnership(entry.paperPositionId, size, entryPrice);
+
+      return {
+        row: {
+          ...entry,
+          filledAmount: size,
+          averagePrice: entryPrice,
+          status: "OPEN",
+          confirmation: "CONFIRMED",
+        },
+        outcome: "ADOPTED",
+      };
+    }
+
+    const working = await this.adapter.getOpenOrders(entry.symbol);
+    if (working.length > 0) return { row: null, outcome: "WORKING" };
+
+    await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
+    await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
+    return { row: null, outcome: "UNFILLED" };
+  }
+
   private async mirrorReconcile(
     openPositions: PaperExecutionPosition[],
   ): Promise<void> {
     const paperIds = new Set(openPositions.map((position) => position.id));
     const owned = await this.listOwnership();
+    const pending = owned.filter((entry) => entry.status === "PENDING");
     const openOwned = owned.filter(
       (entry) =>
         (entry.status === "OPEN" || entry.status === "UNWIND_PENDING") &&
@@ -720,9 +914,51 @@ export class LighterExecutionBridge {
       if (symbol) symbols.add(symbol);
     }
     for (const entry of openOwned) symbols.add(entry.symbol);
+    for (const entry of pending) symbols.add(entry.symbol);
 
     for (const symbol of symbols) {
       const venue = await this.positionsFor(symbol);
+
+      // Resolve durable entry intents before touching anything else. A position
+      // that appeared after the intent was recorded is adopted; an intent with
+      // no position and no working order is closed as never filled. A failed
+      // venue read throws above and leaves the intent PENDING, so nothing is
+      // discarded when the endpoint is unavailable.
+      for (const entry of pending.filter((row) => row.symbol === symbol)) {
+        const claimedByAnother = openOwned.some(
+          (row) => row.symbol === symbol && row.side === entry.side,
+        );
+        const result = await this.resolvePendingOwnership(
+          entry,
+          venue,
+          claimedByAnother,
+        );
+
+        if (result.outcome === "ADOPTED") {
+          this.log(
+            `[EXEC] RECONCILE ${symbol}: adopted ` +
+              `${result.row?.filledAmount ?? 0} ${entry.side} from the venue ` +
+              `for pending paper ${entry.paperPositionId}`,
+          );
+          if (result.row) openOwned.push(result.row);
+        } else if (result.outcome === "DUPLICATE") {
+          this.log(
+            `[EXEC] RECONCILE ${symbol}: pending intent ${entry.paperPositionId} ` +
+              `is covered by another owned ${entry.side}; not adopting`,
+          );
+        } else if (result.outcome === "WORKING") {
+          this.log(
+            `[EXEC] RECONCILE ${symbol}: pending intent ${entry.paperPositionId} ` +
+              `still has a working order; keeping it PENDING`,
+          );
+        } else {
+          this.log(
+            `[EXEC] RECONCILE ${symbol}: pending intent ${entry.paperPositionId} ` +
+              `never filled on the venue; ownership closed`,
+          );
+        }
+      }
+
       const ownedHere = openOwned.filter((entry) => entry.symbol === symbol);
 
       // An owned record whose side is no longer on the venue is flat: the exit
@@ -737,10 +973,14 @@ export class LighterExecutionBridge {
         );
         if (present) continue;
 
-        await this.markOwnershipClosed(entry.paperPositionId, "RECONCILE_CLOSE");
+        await this.markOwnershipClosed(
+          entry.paperPositionId,
+          "RECONCILE_CLOSE",
+          "EXTERNAL",
+        );
         this.log(
           `[EXEC] RECONCILE ${symbol}: bot-owned ${entry.side} for paper ` +
-            `${entry.paperPositionId} is flat on the venue`,
+            `${entry.paperPositionId} is flat on the venue (no bot close order)`,
         );
       }
 
@@ -788,10 +1028,18 @@ export class LighterExecutionBridge {
         });
 
         if (outcome.filled > OWNERSHIP_EPSILON) {
-          await this.addOwnershipClosed(match.paperPositionId, outcome.filled);
+          await this.addOwnershipClosed(
+            match.paperPositionId,
+            outcome.filled,
+            "BOT",
+          );
         }
         if (outcome.remaining <= OWNERSHIP_EPSILON) {
-          await this.markOwnershipClosed(match.paperPositionId, "RECONCILE_CLOSE");
+          await this.markOwnershipClosed(
+            match.paperPositionId,
+            "RECONCILE_CLOSE",
+            "BOT",
+          );
         }
       }
     }
@@ -993,21 +1241,29 @@ export class LighterExecutionBridge {
     const status = this.closeFillStatus(order, filled, input.amount);
     const averagePrice = order.average ?? null;
 
-    await this.record({
-      paperPositionId: input.paperPositionId,
-      action: input.action,
-      symbol: input.symbol,
-      side: closeSide,
-      amount: input.amount,
-      price,
-      orderId: reference,
-      status,
-      requestedAmount: input.amount,
-      filledAmount: filled,
-      remainingAmount: Math.max(0, input.amount - filled),
-      averagePrice,
-      txHash: reference,
-    });
+    await this
+      .record({
+        paperPositionId: input.paperPositionId,
+        action: input.action,
+        symbol: input.symbol,
+        side: closeSide,
+        amount: input.amount,
+        price,
+        orderId: reference,
+        status,
+        requestedAmount: input.amount,
+        filledAmount: filled,
+        remainingAmount: Math.max(0, input.amount - filled),
+        averagePrice,
+        txHash: reference,
+      })
+      .catch((error) => {
+        // The reduction already happened; ownership must still advance.
+        this.log(
+          `[EXEC] WARN ${input.symbol} close filled ${filled}/${input.amount} ` +
+            `but the audit row could not be written: ${this.adapter.redact(error)}`,
+        );
+      });
 
     this.log(
       `[EXEC] ${input.action} ${input.symbol} ${closeSide.toUpperCase()} ` +
@@ -1030,6 +1286,10 @@ export class LighterExecutionBridge {
     filled: number,
     requested: number,
   ): CloseOutcome["status"] {
+    // The measured fill wins over the terminal order status: a canceled or
+    // expired order can still have filled part of the size.
+    if (filled >= requested - OWNERSHIP_EPSILON) return "FILLED";
+    if (filled > OWNERSHIP_EPSILON) return "PARTIALLY_FILLED";
     if (
       order.status === "rejected" ||
       order.status === "canceled" ||
@@ -1037,8 +1297,6 @@ export class LighterExecutionBridge {
     ) {
       return "REJECTED";
     }
-    if (filled >= requested - OWNERSHIP_EPSILON) return "FILLED";
-    if (filled > OWNERSHIP_EPSILON) return "PARTIALLY_FILLED";
     return "UNKNOWN";
   }
 
@@ -1064,6 +1322,9 @@ export class LighterExecutionBridge {
   }
 
   private toOwnership(row: Record<string, unknown>): OwnedVenuePosition {
+    const status = String(row.status);
+    const confirmation = String(row.confirmation ?? "CONFIRMED");
+
     return {
       paperPositionId: String(row.paper_position_id),
       symbol: String(row.symbol),
@@ -1071,19 +1332,30 @@ export class LighterExecutionBridge {
       requestedAmount: Number(row.requested_amount ?? 0),
       filledAmount: Number(row.filled_amount ?? 0),
       closedAmount: Number(row.closed_amount ?? 0),
+      botClosedAmount: Number(row.bot_closed_amount ?? 0),
+      externalClosedAmount: Number(row.external_closed_amount ?? 0),
       averagePrice:
         row.average_price === null || row.average_price === undefined
           ? null
           : Number(row.average_price),
       orderId: row.order_id === null ? null : String(row.order_id),
       status:
-        row.status === "CLOSED"
+        status === "CLOSED"
           ? "CLOSED"
-          : row.status === "UNVERIFIED"
+          : status === "UNVERIFIED"
             ? "UNVERIFIED"
-            : row.status === "UNWIND_PENDING"
+            : status === "UNWIND_PENDING"
               ? "UNWIND_PENDING"
-              : "OPEN",
+              : status === "PENDING"
+                ? "PENDING"
+                : "OPEN",
+      confirmation:
+        confirmation === "INTENT" ||
+        confirmation === "ACKNOWLEDGED" ||
+        confirmation === "FAILED" ||
+        confirmation === "UNRESOLVED"
+          ? confirmation
+          : "CONFIRMED",
     };
   }
 
@@ -1094,24 +1366,31 @@ export class LighterExecutionBridge {
     requestedAmount: number;
     filledAmount: number;
     closedAmount: number;
+    botClosedAmount: number;
+    externalClosedAmount: number;
     averagePrice: number | null;
     orderId: string | null;
-    status: "OPEN" | "CLOSED" | "UNVERIFIED" | "UNWIND_PENDING";
+    status: OwnershipStatus;
+    confirmation: EntryConfirmation;
     now: number;
   }): Promise<void> {
     await withSerializedDatabaseOperation(() =>
       this.connection.run(
         `INSERT INTO lighter_owned_positions
          (paper_position_id, symbol, side, requested_amount, filled_amount,
-          closed_amount, average_price, order_id, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          closed_amount, bot_closed_amount, external_closed_amount,
+          average_price, order_id, status, confirmation, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (paper_position_id) DO UPDATE SET
            requested_amount = excluded.requested_amount,
            filled_amount = excluded.filled_amount,
            closed_amount = excluded.closed_amount,
+           bot_closed_amount = excluded.bot_closed_amount,
+           external_closed_amount = excluded.external_closed_amount,
            average_price = excluded.average_price,
            order_id = excluded.order_id,
            status = excluded.status,
+           confirmation = excluded.confirmation,
            updated_at = excluded.updated_at`,
         [
           entry.paperPositionId,
@@ -1120,9 +1399,12 @@ export class LighterExecutionBridge {
           entry.requestedAmount,
           entry.filledAmount,
           entry.closedAmount,
+          entry.botClosedAmount,
+          entry.externalClosedAmount,
           entry.averagePrice,
           entry.orderId,
           entry.status,
+          entry.confirmation,
           entry.now,
           entry.now,
         ],
@@ -1130,30 +1412,86 @@ export class LighterExecutionBridge {
     );
   }
 
-  /** Advances the closed amount by a confirmed fill, capping at the fill. */
-  private async addOwnershipClosed(
+  /** Records the venue order reference without claiming a fill yet. */
+  private async acknowledgeOwnership(
     paperPositionId: string,
-    amount: number,
+    orderId: string | null,
   ): Promise<void> {
     await withSerializedDatabaseOperation(() =>
       this.connection.run(
         `UPDATE lighter_owned_positions
+         SET order_id = ?, confirmation = 'ACKNOWLEDGED', updated_at = ?
+         WHERE paper_position_id = ?`,
+        [orderId, this.now(), paperPositionId],
+      ),
+    );
+  }
+
+  /** Records that the outcome of the submission is not yet known. */
+  private async setEntryConfirmation(
+    paperPositionId: string,
+    confirmation: EntryConfirmation,
+  ): Promise<void> {
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `UPDATE lighter_owned_positions
+         SET confirmation = ?, updated_at = ?
+         WHERE paper_position_id = ?`,
+        [confirmation, this.now(), paperPositionId],
+      ),
+    );
+  }
+
+  /** Adopts a PENDING intent after the venue confirms a position exists. */
+  private async adoptOwnership(
+    paperPositionId: string,
+    filledAmount: number,
+    averagePrice: number | null,
+  ): Promise<void> {
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `UPDATE lighter_owned_positions
+         SET filled_amount = ?, average_price = COALESCE(?, average_price),
+             status = 'OPEN', confirmation = 'CONFIRMED', updated_at = ?
+         WHERE paper_position_id = ?`,
+        [filledAmount, averagePrice, this.now(), paperPositionId],
+      ),
+    );
+  }
+
+  /**
+   * Advances the closed amount by a measured quantity. `attribution` keeps a
+   * bot reduce-only fill distinct from a size that was found flat on the venue
+   * without this bot closing it.
+   */
+  private async addOwnershipClosed(
+    paperPositionId: string,
+    amount: number,
+    attribution: CloseAttribution,
+  ): Promise<void> {
+    const column =
+      attribution === "BOT" ? "bot_closed_amount" : "external_closed_amount";
+
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `UPDATE lighter_owned_positions
          SET closed_amount = LEAST(filled_amount, closed_amount + ?),
+             ${column} = LEAST(filled_amount, ${column} + ?),
              status = CASE
                WHEN closed_amount + ? >= filled_amount - ? THEN 'CLOSED'
                ELSE status
              END,
              updated_at = ?
          WHERE paper_position_id = ?`,
-        [amount, amount, OWNERSHIP_EPSILON, this.now(), paperPositionId],
+        [amount, amount, amount, OWNERSHIP_EPSILON, this.now(), paperPositionId],
       ),
     );
   }
 
-  /** Moves an ownership row between OPEN, UNWIND_PENDING and CLOSED. */
+  /** Moves an ownership row between OPEN, UNWIND_PENDING, PENDING and CLOSED. */
   private async markOwnershipStatus(
     paperPositionId: string,
-    status: OwnedVenuePosition["status"],
+    status: OwnershipStatus,
   ): Promise<void> {
     await withSerializedDatabaseOperation(() =>
       this.connection.run(
@@ -1165,18 +1503,24 @@ export class LighterExecutionBridge {
     );
   }
 
+  /**
+   * Terminates an ownership row, attributing whatever remainder is still
+   * unaccounted to `attribution`. BOT means the venue was confirmed flat after
+   * this bot's own close; EXTERNAL means the position disappeared without one.
+   */
   private async markOwnershipClosed(
     paperPositionId: string,
     _reason: string,
+    attribution: CloseAttribution,
   ): Promise<void> {
-    await withSerializedDatabaseOperation(() =>
-      this.connection.run(
-        `UPDATE lighter_owned_positions
-         SET closed_amount = filled_amount, status = 'CLOSED', updated_at = ?
-         WHERE paper_position_id = ?`,
-        [this.now(), paperPositionId],
-      ),
-    );
+    const entry = await this.loadOwnership(paperPositionId);
+    if (!entry) return;
+
+    const remaining = Math.max(0, entry.filledAmount - entry.closedAmount);
+    if (remaining > OWNERSHIP_EPSILON) {
+      await this.addOwnershipClosed(paperPositionId, remaining, attribution);
+    }
+    await this.markOwnershipStatus(paperPositionId, "CLOSED");
   }
 
   /** Closes every position the registry proves the bot owns. */
@@ -1191,59 +1535,119 @@ export class LighterExecutionBridge {
   private async flattenOwned(
     action: ExecutionAction,
   ): Promise<OwnedVenuePosition[]> {
-    const owned = (await this.listOwnership()).filter(
-      (entry) =>
-        (entry.status === "OPEN" || entry.status === "UNWIND_PENDING") &&
-        entry.filledAmount - entry.closedAmount > OWNERSHIP_EPSILON,
-    );
+    const registry = await this.listOwnership();
     const residual: OwnedVenuePosition[] = [];
+    const owned: OwnedVenuePosition[] = [];
+
+    // Shutdown must not leave a fill unowned merely because it was never
+    // confirmed. Resolve intents from venue state before flattening.
+    const claimedSides = new Set(
+      registry
+        .filter(
+          (row) =>
+            (row.status === "OPEN" || row.status === "UNWIND_PENDING") &&
+            row.filledAmount - row.closedAmount > OWNERSHIP_EPSILON,
+        )
+        .map((row) => `${row.symbol}:${row.side}`),
+    );
+
+    for (const entry of registry.filter((row) => row.status === "PENDING")) {
+      try {
+        const alreadyClaimed = claimedSides.has(`${entry.symbol}:${entry.side}`);
+        const result = await this.resolvePendingOwnership(
+          entry,
+          await this.positionsFor(entry.symbol),
+          alreadyClaimed,
+        );
+        if (result.outcome === "ADOPTED" && result.row) {
+          claimedSides.add(`${entry.symbol}:${entry.side}`);
+          owned.push(result.row);
+          this.log(
+            `[EXEC] ${action} resolved pending entry ${entry.paperPositionId} ` +
+              `on ${entry.symbol}: ${result.row.filledAmount} ${entry.side}`,
+          );
+        }
+      } catch (error) {
+        residual.push(entry);
+        this.log(
+          `[EXEC] ERROR ${action} could not resolve pending intent ` +
+            `${entry.paperPositionId} on ${entry.symbol}: ` +
+            `${this.adapter.redact(error)}`,
+        );
+      }
+    }
+
+    owned.push(
+      ...registry.filter(
+        (entry) =>
+          (entry.status === "OPEN" || entry.status === "UNWIND_PENDING") &&
+          entry.filledAmount - entry.closedAmount > OWNERSHIP_EPSILON,
+      ),
+    );
 
     for (const entry of owned) {
-      let unresolved = true;
+      let resolved = false;
 
       for (let attempt = 1; attempt <= SHUTDOWN_FLATTEN_ATTEMPTS; attempt++) {
-        const remaining = entry.filledAmount - entry.closedAmount;
-        const held = (await this.positionsFor(entry.symbol)).find(
-          (position) => position.side === entry.side,
-        );
+        // A thrown order, price or position error must not abort the remaining
+        // attempts or the other owned positions.
+        try {
+          const remaining = entry.filledAmount - entry.closedAmount;
+          const held = (await this.positionsFor(entry.symbol)).find(
+            (position) => position.side === entry.side,
+          );
 
-        if (!held || !(remaining > OWNERSHIP_EPSILON)) {
-          await this.markOwnershipClosed(entry.paperPositionId, action);
-          unresolved = false;
-          break;
+          if (!held || !(remaining > OWNERSHIP_EPSILON)) {
+            await this.markOwnershipClosed(entry.paperPositionId, action, "BOT");
+            resolved = true;
+            break;
+          }
+
+          const amount = Math.min(remaining, Math.abs(held.contracts));
+          const outcome = await this.closeOwned({
+            paperPositionId: entry.paperPositionId,
+            symbol: entry.symbol,
+            ownedSide: entry.side,
+            amount,
+            reason: "shutdown",
+            action,
+          });
+
+          if (outcome.filled > OWNERSHIP_EPSILON) {
+            await this.addOwnershipClosed(
+              entry.paperPositionId,
+              outcome.filled,
+              "BOT",
+            );
+          }
+
+          if (outcome.remaining <= OWNERSHIP_EPSILON) {
+            await this.markOwnershipClosed(entry.paperPositionId, action, "BOT");
+            resolved = true;
+            break;
+          }
+
+          this.log(
+            `[EXEC] ${action} ${entry.symbol} attempt ${attempt}/${SHUTDOWN_FLATTEN_ATTEMPTS} ` +
+              `left ${outcome.remaining}; retrying`,
+          );
+        } catch (error) {
+          this.log(
+            `[EXEC] ERROR ${action} ${entry.symbol} attempt ` +
+              `${attempt}/${SHUTDOWN_FLATTEN_ATTEMPTS} failed: ` +
+              `${this.adapter.redact(error)}; retrying`,
+          );
         }
 
-        const amount = Math.min(remaining, Math.abs(held.contracts));
-        const outcome = await this.closeOwned({
-          paperPositionId: entry.paperPositionId,
-          symbol: entry.symbol,
-          ownedSide: entry.side,
-          amount,
-          reason: "shutdown",
-          action,
-        });
-
-        if (outcome.filled > OWNERSHIP_EPSILON) {
-          await this.addOwnershipClosed(entry.paperPositionId, outcome.filled);
-        }
-
-        if (outcome.remaining <= OWNERSHIP_EPSILON) {
-          await this.markOwnershipClosed(entry.paperPositionId, action);
-          unresolved = false;
-          break;
-        }
-
-        this.log(
-          `[EXEC] ${action} ${entry.symbol} attempt ${attempt}/${SHUTDOWN_FLATTEN_ATTEMPTS} ` +
-            `left ${outcome.remaining}; retrying`,
-        );
         if (attempt < SHUTDOWN_FLATTEN_ATTEMPTS) {
           await this.sleep(DEFAULT_SLEEP_MS);
         }
       }
 
-      if (unresolved) {
-        const current = await this.loadOwnership(entry.paperPositionId);
+      if (!resolved) {
+        const current = await this
+          .loadOwnership(entry.paperPositionId)
+          .catch(() => null);
         if (current) residual.push(current);
         this.log(
           `[EXEC] ERROR ${action} could not flatten ${entry.symbol} ` +
@@ -1321,6 +1725,18 @@ export class LighterExecutionBridge {
           updated_at BIGINT NOT NULL
         )
       `);
+
+      // Entry confirmation and close attribution were added after the first
+      // ownership version; the migrations keep existing databases usable.
+      for (const column of [
+        "confirmation VARCHAR DEFAULT 'CONFIRMED'",
+        "bot_closed_amount DOUBLE DEFAULT 0",
+        "external_closed_amount DOUBLE DEFAULT 0",
+      ]) {
+        await this.connection.run(
+          `ALTER TABLE lighter_owned_positions ADD COLUMN IF NOT EXISTS ${column}`,
+        );
+      }
     });
   }
 
