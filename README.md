@@ -124,7 +124,7 @@ requests.
 | Public mainnet market data | Working (139 markets, 89 eligible) | Working (65 PERP markets, all eligible) | Working (244 markets, 209 eligible) |
 | Public testnet market data | Working (144 markets) | Working (25 PERP markets) | Working (5 markets, 3 eligible perpetuals) |
 | Private account reads | Working on mainnet, opt-in | Working on testnet with a subkey | Verified on testnet; the UI deployment was reset, so the account must be recreated |
-| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account | Implemented behind gates; no live testnet order run yet |
+| Order placement | Blocked by gates and missing testnet keys | Blocked by gates and an unfunded account | Implemented behind gates with an ownership registry; no live testnet order run yet |
 | 5-minute backfill | Working; validated against live data | Working; validated against live data | Working; validated against live data |
 | Settlement | USDT | USDC | USDC |
 
@@ -328,7 +328,10 @@ LIGHTER_TESTNET_BASE_URL=https://api.testnet.lighter.xyz
 LIGHTER_EXECUTION_ENABLED=false
 LIGHTER_LEVERAGE=5
 LIGHTER_MARGIN_MODE=cross
-LIGHTER_EXECUTION_SYMBOLS=BTC,ETH,SOL
+LIGHTER_EXECUTION_SYMBOLS=BTC,ETH
+LIGHTER_SIZE_MULTIPLIER=1
+LIGHTER_MAX_NOTIONAL_USD=0
+LIGHTER_FLATTEN_ON_SHUTDOWN=true
 LIGHTER_WORST_PRICE_SLIPPAGE_PCT=1
 LIGHTER_ALLOW_MAINNET_EXECUTION=false
 LIGHTER_RECONCILE_INTERVAL_MS=60000
@@ -534,9 +537,10 @@ protection and validation are enforced in code and by the primary key.
   and keys then return `29404 not found` even though the same index may still
   exist on the docs deployment. Recreate the account and key; no code change is
   required.
-- **Lighter reconcile scope:** orphan positions are only closed for symbols in
-  `LIGHTER_EXECUTION_SYMBOLS`. Remove a symbol from that list while a position is
-  open and the bridge will no longer manage it.
+- **Lighter reconcile scope:** orphan positions are reconciled for symbols in
+  `LIGHTER_EXECUTION_SYMBOLS` and for every symbol in the ownership registry.
+  Removing a configured symbol does not strand a position the bot already owns,
+  but a manual or external position is never closed.
 - **Lighter order price:** every order, including a market order, carries a
   price — it is the worst acceptable execution price, so it cannot be omitted.
 - **Lighter funding history:** `/api/v1/fundings` reports 1h or 1d entries with
@@ -565,9 +569,45 @@ and execution costs (Phase 8). Live trading stays disabled on all venues.
 
 ### Execution safety additions
 
-- `LIGHTER_SIZE_MULTIPLIER` (default 1) scales the paper quantity sent to the venue.
-- `connect()` refuses a leverage whose liquidation distance is under 2x the paper stop loss.
-- Opens are skipped (audited as `SKIPPED`) when the venue already holds a position on the symbol, margin is insufficient, or the size is below the venue minimum.
+- `LIGHTER_SIZE_MULTIPLIER` (default 1) scales the paper quantity sent to the venue; `LIGHTER_MAX_NOTIONAL_USD` caps a single entry independently.
+- `connect()` refuses a leverage whose liquidation distance is under 2x the paper stop loss, and refuses to start if the venue rejects the leverage.
+- Opens are skipped (audited as `SKIPPED`) when the venue already holds a position on the symbol, has a resting order there, margin is insufficient, the balance is unavailable, leverage was not applied, or the size is below the venue minimum.
+- `connect()` fails closed when the venue rejects the leverage, so the process stays paper-only instead of trading at an unknown account leverage.
+- After a fill, the venue-reported leverage is compared with the configured value; a higher value triggers an immediate reduce-only unwind.
 - Closes are skipped when the venue has no position; closes are always reduce-only.
-- The reconciler keeps running after the Phase 7 session ends.
-- Not implemented: venue-side stop-loss/take-profit orders; stops are still evaluated by the paper engine on closed 5m candles.
+
+### Position ownership
+
+The bot never closes a position it cannot prove it opened. `lighter_owned_positions`
+is the registry, keyed by `paper_position_id`:
+
+- An entry is recorded only after the venue confirms a fill. Opens are refused
+  when the market already has a position or a resting order, so a size that
+  appears immediately afterwards is attributable to the bot's order.
+- A fill of zero (thin testnet book) is stored as `UNVERIFIED`. The bridge will
+  not close an `UNVERIFIED` or missing record, and reconcile treats the venue
+  position as external.
+- `CLOSE` and `RECONCILE_CLOSE` send at most the bot-owned remaining size. If the
+  venue position is larger, the excess is left untouched; if its side does not
+  match the owned side, the close is refused.
+- Each execution row records requested, filled, remaining and average price plus
+  the order id / transaction hash (`lighter_executions`).
+- The reconciler walks symbols from the registry as well as the config, so
+  removing a symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand an owned
+  position.
+- On a clean shutdown, `LIGHTER_FLATTEN_ON_SHUTDOWN=true` closes owned positions
+  before the client disconnects. `SIGKILL` cannot run this policy.
+- At week end, every paper position is liquidated even without a fresh quote
+  (last stored candle, then entry price), so the mirror is not left open.
+
+Two consequences are deliberate:
+
+- A position with no registry row (manual, another process, or opened before
+  this table existed) is never closed. Close it by hand or use a dedicated
+  sub-account for the bot.
+- Because a clean shutdown flattens owned positions, restarting mid-session
+  does not re-enter an open paper position. The paper book continues without a
+  venue mirror for that position.
+
+Not implemented: venue-side stop-loss/take-profit orders; stops are still
+evaluated by the paper engine on closed 5m candles.

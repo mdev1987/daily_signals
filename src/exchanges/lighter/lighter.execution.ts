@@ -3,6 +3,7 @@ import {
   type DatabaseConnection,
 } from "../../database";
 import type { MarketInfo, Order, OrderBook, Position } from "../exchange.types";
+import { ExchangeConfigurationError } from "../exchange.errors";
 import { LighterAdapter } from "./lighter.adapter";
 import { PAPER_STOP_LOSS_PCT } from "../../config";
 import {
@@ -39,7 +40,29 @@ export type ExecutionAction =
   | "OPEN"
   | "CLOSE"
   | "RECONCILE_CLOSE"
+  | "SHUTDOWN_CLOSE"
   | "SKIPPED";
+
+/**
+ * What the bot believes it owns on the venue, keyed by the paper position that
+ * caused it. A venue position is never closed unless a matching `OPEN` row
+ * exists here with a positive remaining size.
+ */
+export interface OwnedVenuePosition {
+  paperPositionId: string;
+  symbol: string;
+  side: "long" | "short";
+  requestedAmount: number;
+  filledAmount: number;
+  closedAmount: number;
+  averagePrice: number | null;
+  orderId: string | null;
+  /** OPEN = verified and manageable. UNVERIFIED = never claim it. */
+  status: "OPEN" | "CLOSED" | "UNVERIFIED";
+}
+
+/** Amounts below this are treated as fully closed (venue size steps). */
+const OWNERSHIP_EPSILON = 1e-9;
 
 export interface LighterExecutionBridgeOptions {
   connection: DatabaseConnection;
@@ -175,13 +198,14 @@ export class LighterExecutionBridge {
       const symbol = this.toVenueSymbol(base);
       if (!symbol) continue;
 
+      // Fail closed: `assertStopBeforeLiquidation()` and the margin check both
+      // assume the requested leverage is actually applied. Refusing to start is
+      // safer than trading at an unknown account leverage.
       try {
         await this.ensureLeverage(symbol);
       } catch (error) {
-        // Trading can still continue at the account's existing leverage; the
-        // failure is loud in the log instead of aborting the whole bot.
-        this.log(
-          `[EXEC] Could not set ${this.config.execution.leverage}x on ${symbol}: ` +
+        throw new ExchangeConfigurationError(
+          `Could not set ${this.config.execution.leverage}x on ${symbol}: ` +
             this.adapter.redact(error),
         );
       }
@@ -223,6 +247,18 @@ export class LighterExecutionBridge {
 
   async close(): Promise<void> {
     await this.flush();
+
+    if (this.config.execution.flattenOnShutdown) {
+      try {
+        await this.flattenOwned("SHUTDOWN_CLOSE");
+      } catch (error) {
+        this.log(
+          `[EXEC] shutdown flatten failed: ${this.adapter.redact(error)}; ` +
+            `check the venue for open positions`,
+        );
+      }
+    }
+
     await this.adapter.close();
   }
 
@@ -247,20 +283,37 @@ export class LighterExecutionBridge {
     try {
       const market = await this.market(symbol);
 
+      // A duplicate open event must never add to an already-owned position.
+      const alreadyOwned = await this.loadOwnership(position.id);
+      if (alreadyOwned && alreadyOwned.status !== "CLOSED") {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `paper position ${position.id} is already owned by this bot ` +
+            `(${alreadyOwned.status}, ${alreadyOwned.filledAmount - alreadyOwned.closedAmount} open)`,
+        );
+        return;
+      }
+
+      // Fail closed: an unknown account leverage invalidates both the
+      // liquidation guard and the margin estimate.
       try {
         await this.ensureLeverage(symbol);
       } catch (error) {
-        // An existing leverage setting is still usable; refusing to trade
-        // would be worse than trading at the account's current margin.
-        this.log(
-          `[EXEC] WARN could not set ${this.config.execution.leverage}x on ${symbol}: ` +
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `leverage ${this.config.execution.leverage}x was not applied: ` +
             this.adapter.redact(error),
         );
+        return;
       }
 
-      // A venue position that paper does not know about (a close that failed,
-      // or a manual trade) must not be stacked onto. Adding to it would make
-      // the later reduce-only close mirror the wrong size.
+      // A venue position the bot did not open (a manual trade or another
+      // process) must not be stacked onto, and a resting order on the same
+      // market could fill into one.
       const existing = await this.positionsFor(symbol);
       if (existing.length > 0) {
         await this.skip(
@@ -268,6 +321,17 @@ export class LighterExecutionBridge {
           symbol,
           side,
           `venue already holds ${existing[0]!.side} ${Math.abs(existing[0]!.contracts)}`,
+        );
+        return;
+      }
+
+      const openOrders = await this.adapter.getOpenOrders(symbol);
+      if (openOrders.length > 0) {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `venue has ${openOrders.length} open order(s) on the market`,
         );
         return;
       }
@@ -307,11 +371,34 @@ export class LighterExecutionBridge {
         return;
       }
 
-      // Leveraged margin check: the venue would reject an unfunded order, but
-      // a clear local reason is easier to act on than a signer error.
-      const requiredMargin = (amount * price) / this.config.execution.leverage;
+      // The size multiplier can inflate a small paper trade; cap the resulting
+      // exposure independently of the multiplier.
+      const notional = amount * price;
+      const cap = this.config.execution.maxNotionalUsd;
+      if (cap > 0 && notional > cap) {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `notional ${notional.toFixed(2)} exceeds LIGHTER_MAX_NOTIONAL_USD ${cap}`,
+        );
+        return;
+      }
+
+      // Fail closed: without a readable free balance the margin check cannot
+      // run, so no entry is allowed.
+      const requiredMargin = notional / this.config.execution.leverage;
       const free = await this.freeUsdc();
-      if (free !== null && requiredMargin > free) {
+      if (free === null) {
+        await this.skip(
+          position,
+          symbol,
+          side,
+          `free USDC collateral is unavailable; refusing to open`,
+        );
+        return;
+      }
+      if (requiredMargin > free) {
         await this.skip(
           position,
           symbol,
@@ -329,6 +416,69 @@ export class LighterExecutionBridge {
         price,
       });
 
+      const reference = orderReference(order);
+      const confirmation = await this.verifyOpen(
+        symbol,
+        position.direction,
+        amount,
+      );
+      const reportedFill =
+        order.filled !== null && Number.isFinite(order.filled) && order.filled > 0
+          ? order.filled
+          : 0;
+      const filled = Math.min(
+        amount,
+        Math.max(reportedFill, confirmation.filled),
+      );
+      const averagePrice = confirmation.entryPrice ?? order.price ?? price;
+
+      // The venue's reported leverage is derived from the position's initial
+      // margin fraction. If it exceeds the configured value the liquidation
+      // guard no longer holds, so unwind immediately instead of leaving a
+      // position whose risk the bot cannot model.
+      const actualLeverage = confirmation.leverage;
+      if (
+        actualLeverage !== null &&
+        actualLeverage > this.config.execution.leverage * 1.01
+      ) {
+        await this.recordFailure(
+          position.id,
+          "OPEN",
+          symbol,
+          side,
+          amount,
+          price,
+          new Error(
+            `venue reports ${actualLeverage.toFixed(2)}x but ` +
+              `${this.config.execution.leverage}x was requested`,
+          ),
+        );
+
+        if (filled > OWNERSHIP_EPSILON) {
+          await this.emergencyClose(
+            position,
+            symbol,
+            position.direction,
+            filled,
+            "LEVERAGE_MISMATCH",
+          );
+        }
+
+        await this.recordOwnership({
+          paperPositionId: position.id,
+          symbol,
+          side: position.direction,
+          requestedAmount: amount,
+          filledAmount: filled,
+          closedAmount: filled,
+          averagePrice,
+          orderId: reference,
+          status: filled > OWNERSHIP_EPSILON ? "CLOSED" : "UNVERIFIED",
+          now: this.now(),
+        });
+        return;
+      }
+
       await this.record({
         paperPositionId: position.id,
         action: "OPEN",
@@ -336,17 +486,41 @@ export class LighterExecutionBridge {
         side,
         amount,
         price,
-        orderId: orderReference(order),
+        orderId: reference,
         status: orderAuditStatus(order),
+        requestedAmount: amount,
+        filledAmount: filled,
+        remainingAmount: Math.max(0, amount - filled),
+        averagePrice,
+        txHash: reference,
+      });
+
+      await this.recordOwnership({
+        paperPositionId: position.id,
+        symbol,
+        side: position.direction,
+        requestedAmount: amount,
+        filledAmount: filled,
+        closedAmount: 0,
+        averagePrice,
+        orderId: reference,
+        status: filled > OWNERSHIP_EPSILON ? "OPEN" : "UNVERIFIED",
+        now: this.now(),
       });
 
       this.log(
         `[EXEC] OPEN ${symbol} ${side.toUpperCase()} ${amount} @ worst ${price.toFixed(4)} ` +
           `| ${this.config.execution.leverage}x ${this.config.execution.marginMode} ` +
-          `| order ${orderReference(order) ?? "?"} ${orderAuditStatus(order)}`,
+          `| order ${reference ?? "?"} ${orderAuditStatus(order)} ` +
+          `| filled ${filled}/${amount}`,
       );
 
-      await this.verifyOpen(symbol, position.direction, amount);
+      if (filled <= OWNERSHIP_EPSILON) {
+        this.log(
+          `[EXEC] WARN ${symbol} entry is UNVERIFIED: no fill was observed, so ` +
+            `the bot will not close this position. Check the venue manually.`,
+        );
+      }
     } catch (error) {
       await this.recordFailure(position.id, "OPEN", symbol, side, amount, price, error);
       throw error;
@@ -366,23 +540,76 @@ export class LighterExecutionBridge {
     let price: number | null = null;
 
     try {
-      const held = (await this.positionsFor(symbol))[0];
-
-      // Nothing on the venue means the entry never filled (thin testnet book)
-      // or was already closed. A reduce-only order would only be noise.
-      if (!held) {
+      // Ownership is the hard gate: no verified OPEN record, no close. This is
+      // what keeps a manual position, or one opened by another process on the
+      // same account, untouched even when the symbol and side match.
+      const owned = await this.loadOwnership(position.id);
+      if (!owned || owned.status !== "OPEN") {
         await this.skip(
           position,
           symbol,
           fallbackSide,
-          `nothing to close on the venue (${exitReason})`,
+          `no verified bot ownership for paper position ${position.id} ` +
+            `(${owned?.status ?? "missing"}); refusing to close`,
           "CLOSE",
         );
         return;
       }
 
-      amount = Math.abs(held.contracts);
-      side = held.side === "long" ? "sell" : "buy";
+      const ownedRemaining = owned.filledAmount - owned.closedAmount;
+      if (ownedRemaining <= OWNERSHIP_EPSILON) {
+        await this.skip(
+          position,
+          symbol,
+          fallbackSide,
+          `bot-owned size is already closed`,
+          "CLOSE",
+        );
+        return;
+      }
+
+      const held = (await this.positionsFor(symbol)).find(
+        (candidate) => candidate.side === owned.side,
+      );
+
+      // The venue is already flat (or only an unowned position remains). Never
+      // send a reduce-only order for something the bot does not own.
+      if (!held) {
+        const other = (await this.positionsFor(symbol))[0];
+        if (other) {
+          await this.skip(
+            position,
+            symbol,
+            fallbackSide,
+            `venue position is ${other.side}, but the bot owns ${owned.side}; ` +
+              `refusing to close an external position`,
+            "CLOSE",
+          );
+        } else {
+          await this.markOwnershipClosed(position.id, "CLOSE");
+          await this.skip(
+            position,
+            symbol,
+            fallbackSide,
+            `nothing to close on the venue (${exitReason})`,
+            "CLOSE",
+          );
+        }
+        return;
+      }
+
+      const venueAmount = Math.abs(held.contracts);
+      // Close only the bot-owned size. If the venue position is larger, the
+      // excess belongs to someone else and stays untouched.
+      amount = Math.min(ownedRemaining, venueAmount);
+      side = owned.side === "long" ? "sell" : "buy";
+
+      if (venueAmount > ownedRemaining + OWNERSHIP_EPSILON) {
+        this.log(
+          `[EXEC] WARN ${symbol} venue holds ${venueAmount}, bot owns ` +
+            `${ownedRemaining}; closing only the owned size`,
+        );
+      }
 
       price = await this.worstPrice(symbol, side);
       if (price === null) {
@@ -398,6 +625,7 @@ export class LighterExecutionBridge {
         reduceOnly: true,
       });
 
+      const reference = orderReference(order);
       await this.record({
         paperPositionId: position.id,
         action: "CLOSE",
@@ -405,17 +633,27 @@ export class LighterExecutionBridge {
         side,
         amount,
         price,
-        orderId: orderReference(order),
+        orderId: reference,
         status: orderAuditStatus(order),
+        requestedAmount: amount,
+        filledAmount: amount,
+        remainingAmount: Math.max(0, ownedRemaining - amount),
+        averagePrice: order.price ?? price,
+        txHash: reference,
       });
 
       this.log(
         `[EXEC] CLOSE ${symbol} ${side.toUpperCase()} ${amount} (reduce only) ` +
           `@ worst ${price.toFixed(4)} | ${exitReason} | ` +
-          `order ${orderReference(order) ?? "?"} ${orderAuditStatus(order)}`,
+          `order ${reference ?? "?"} ${orderAuditStatus(order)}`,
       );
 
-      await this.verifyClosed(symbol);
+      const stillOpen = await this.verifyClosed(symbol, owned.side);
+      if (!stillOpen) {
+        await this.markOwnershipClosed(position.id, "CLOSE");
+      }
+      // A partially filled close leaves the record OPEN so reconcile retries the
+      // remainder; closed_amount is only advanced when the venue confirms flat.
     } catch (error) {
       await this.recordFailure(position.id, "CLOSE", symbol, side, amount, price, error);
       throw error;
@@ -425,34 +663,69 @@ export class LighterExecutionBridge {
   private async mirrorReconcile(
     openPositions: PaperExecutionPosition[],
   ): Promise<void> {
-    const managed = openPositions
-      .map((position) => this.toVenueSymbol(position.symbol))
-      .filter((symbol): symbol is string => symbol !== null);
+    const paperIds = new Set(openPositions.map((position) => position.id));
+    const owned = await this.listOwnership();
+    const openOwned = owned.filter(
+      (entry) =>
+        entry.status === "OPEN" &&
+        entry.filledAmount - entry.closedAmount > OWNERSHIP_EPSILON,
+    );
 
+    // Symbols come from the ownership registry as well as the current config,
+    // so removing a symbol from LIGHTER_EXECUTION_SYMBOLS cannot strand a
+    // position the bot already opened.
+    const symbols = new Set<string>();
     for (const base of this.config.execution.symbols) {
       const symbol = this.toVenueSymbol(base);
-      if (!symbol) continue;
+      if (symbol) symbols.add(symbol);
+    }
+    for (const entry of openOwned) symbols.add(entry.symbol);
 
+    for (const symbol of symbols) {
       const venue = await this.positionsFor(symbol);
+      const ownedHere = openOwned.filter((entry) => entry.symbol === symbol);
 
-      if (managed.includes(symbol) && venue.length === 0) {
-        if (!this.missingLogged.has(symbol)) {
-          this.missingLogged.add(symbol);
+      if (venue.length === 0) {
+        // Every owned position on this symbol is gone at the venue. Mark it
+        // closed so it is not retried forever.
+        for (const entry of ownedHere) {
+          await this.markOwnershipClosed(entry.paperPositionId, "RECONCILE_CLOSE");
           this.log(
-            `[EXEC] WARN ${symbol} has an open paper position but no venue position; ` +
-              `the entry may not have filled on a thin book`,
+            `[EXEC] RECONCILE ${symbol}: bot-owned position for paper ` +
+              `${entry.paperPositionId} is flat on the venue`,
           );
         }
-      } else if (venue.length > 0) {
-        this.missingLogged.delete(symbol);
+        continue;
       }
 
       for (const held of venue) {
-        if (Math.abs(held.contracts) <= 0) continue;
-        if (managed.includes(symbol)) continue;
+        if (Math.abs(held.contracts) <= OWNERSHIP_EPSILON) continue;
 
-        const side = held.side === "long" ? "sell" : "buy";
-        const amount = Math.abs(held.contracts);
+        const match = ownedHere.find((entry) => entry.side === held.side);
+        if (!match) {
+          // No ownership record on this side: this is a manual or external
+          // position. Never close it.
+          if (!this.missingLogged.has(`${symbol}:${held.side}`)) {
+            this.missingLogged.add(`${symbol}:${held.side}`);
+            this.log(
+              `[EXEC] ${symbol} ${held.side} ${Math.abs(held.contracts)} is not ` +
+                `owned by this bot; leaving it untouched`,
+            );
+          }
+          continue;
+        }
+        this.missingLogged.delete(`${symbol}:${held.side}`);
+
+        if (paperIds.has(match.paperPositionId)) {
+          // Paper still tracks the position; it is in sync.
+          continue;
+        }
+
+        const remaining = match.filledAmount - match.closedAmount;
+        const amount = Math.min(remaining, Math.abs(held.contracts));
+        if (!(amount > OWNERSHIP_EPSILON)) continue;
+
+        const side = match.side === "long" ? "sell" : "buy";
         const price = await this.worstPrice(symbol, side);
         if (price === null) continue;
 
@@ -465,21 +738,33 @@ export class LighterExecutionBridge {
           reduceOnly: true,
         });
 
+        const reference = orderReference(order);
         await this.record({
-          paperPositionId: "reconcile",
+          paperPositionId: match.paperPositionId,
           action: "RECONCILE_CLOSE",
           symbol,
           side,
           amount,
           price,
-          orderId: orderReference(order),
+          orderId: reference,
           status: orderAuditStatus(order),
+          requestedAmount: amount,
+          filledAmount: amount,
+          remainingAmount: Math.max(0, remaining - amount),
+          averagePrice: order.price ?? price,
+          txHash: reference,
         });
 
         this.log(
-          `[EXEC] RECONCILE closed orphan ${symbol} ${side.toUpperCase()} ${amount} ` +
-            `| order ${orderReference(order) ?? "?"} ${orderAuditStatus(order)}`,
+          `[EXEC] RECONCILE closed bot-owned ${symbol} ${side.toUpperCase()} ` +
+            `${amount} (paper ${match.paperPositionId} is closed) ` +
+            `| order ${reference ?? "?"} ${orderAuditStatus(order)}`,
         );
+
+        const stillOpen = await this.verifyClosed(symbol, match.side);
+        if (!stillOpen) {
+          await this.markOwnershipClosed(match.paperPositionId, "RECONCILE_CLOSE");
+        }
       }
     }
   }
@@ -535,7 +820,10 @@ export class LighterExecutionBridge {
     );
   }
 
-  /** Free USDC collateral, or null when the venue does not report it. */
+  /**
+   * Free USDC collateral, or null when the venue does not report it. Callers
+   * must treat null as "do not trade": the margin check cannot run.
+   */
   private async freeUsdc(): Promise<number | null> {
     const balances = await this.adapter.getBalance();
     const usdc = balances.find((entry) => entry.currency.toUpperCase() === "USDC");
@@ -575,7 +863,11 @@ export class LighterExecutionBridge {
     symbol: string,
     direction: "long" | "short",
     expected: number,
-  ): Promise<void> {
+  ): Promise<{
+    filled: number;
+    entryPrice: number | null;
+    leverage: number | null;
+  }> {
     await this.sleep(DEFAULT_SLEEP_MS);
     const held = (await this.positionsFor(symbol)).find(
       (position) => position.side === direction,
@@ -586,25 +878,271 @@ export class LighterExecutionBridge {
         `[EXEC] WARN ${symbol} ${direction} did not appear on the venue after ` +
           `${DEFAULT_SLEEP_MS}ms; the testnet book may be too thin to fill`,
       );
-      return;
+      return { filled: 0, entryPrice: null, leverage: null };
     }
 
-    if (Math.abs(held.contracts) + Number.EPSILON < expected) {
+    const filled = Math.abs(held.contracts);
+    if (filled + Number.EPSILON < expected) {
       this.log(
-        `[EXEC] WARN ${symbol} partial fill: ${Math.abs(held.contracts)} of ${expected}`,
+        `[EXEC] WARN ${symbol} partial fill: ${filled} of ${expected}`,
       );
     }
+    return {
+      filled,
+      entryPrice: Number.isFinite(held.entryPrice) ? held.entryPrice : null,
+      leverage: Number.isFinite(held.leverage) ? held.leverage : null,
+    };
   }
 
-  private async verifyClosed(symbol: string): Promise<void> {
+  /** Returns true when a position on the given side is still open. */
+  private async verifyClosed(
+    symbol: string,
+    side?: "long" | "short",
+  ): Promise<boolean> {
     await this.sleep(DEFAULT_SLEEP_MS);
-    const held = await this.positionsFor(symbol);
+    const held = (await this.positionsFor(symbol)).filter(
+      (position) => side === undefined || position.side === side,
+    );
 
     if (held.length > 0) {
       this.log(
         `[EXEC] WARN ${symbol} still shows ${held[0]!.contracts} after the close order`,
       );
     }
+
+    return held.length > 0;
+  }
+
+  /** Unwinds a position the bot just opened when a risk check fails. */
+  private async emergencyClose(
+    position: PaperExecutionPosition,
+    symbol: string,
+    ownedSide: "long" | "short",
+    amount: number,
+    reason: string,
+  ): Promise<void> {
+    const closeSide = ownedSide === "long" ? "sell" : "buy";
+    const price = await this.worstPrice(symbol, closeSide);
+    if (price === null) {
+      this.log(
+        `[EXEC] ERROR ${symbol} ${reason}: no usable ${closeSide} price to unwind`,
+      );
+      return;
+    }
+
+    const order = await this.adapter.createOrder({
+      symbol,
+      type: "market",
+      side: closeSide,
+      amount,
+      price,
+      reduceOnly: true,
+    });
+
+    const reference = orderReference(order);
+    await this.record({
+      paperPositionId: position.id,
+      action: "CLOSE",
+      symbol,
+      side: closeSide,
+      amount,
+      price,
+      orderId: reference,
+      status: orderAuditStatus(order),
+      error: `risk unwind: ${reason}`,
+      requestedAmount: amount,
+      filledAmount: amount,
+      remainingAmount: 0,
+      averagePrice: order.price ?? price,
+      txHash: reference,
+    }).catch(() => undefined);
+
+    this.log(
+      `[EXEC] ERROR ${symbol} ${reason}; unwinding ${amount} ` +
+        `| order ${reference ?? "?"} ${orderAuditStatus(order)}`,
+    );
+
+    await this.verifyClosed(symbol, ownedSide);
+  }
+
+  // -------------------------------------------------------------------------
+  // Ownership registry
+  // -------------------------------------------------------------------------
+
+  private async loadOwnership(
+    paperPositionId: string,
+  ): Promise<OwnedVenuePosition | null> {
+    const result = await this.readRows(
+      "SELECT * FROM lighter_owned_positions WHERE paper_position_id = ?",
+      [paperPositionId],
+    );
+    return result.length > 0 ? this.toOwnership(result[0]!) : null;
+  }
+
+  private async listOwnership(): Promise<OwnedVenuePosition[]> {
+    const result = await this.readRows(
+      "SELECT * FROM lighter_owned_positions ORDER BY created_at",
+    );
+    return result.map((row) => this.toOwnership(row));
+  }
+
+  private toOwnership(row: Record<string, unknown>): OwnedVenuePosition {
+    return {
+      paperPositionId: String(row.paper_position_id),
+      symbol: String(row.symbol),
+      side: String(row.side) === "short" ? "short" : "long",
+      requestedAmount: Number(row.requested_amount ?? 0),
+      filledAmount: Number(row.filled_amount ?? 0),
+      closedAmount: Number(row.closed_amount ?? 0),
+      averagePrice:
+        row.average_price === null || row.average_price === undefined
+          ? null
+          : Number(row.average_price),
+      orderId: row.order_id === null ? null : String(row.order_id),
+      status:
+        row.status === "CLOSED"
+          ? "CLOSED"
+          : row.status === "UNVERIFIED"
+            ? "UNVERIFIED"
+            : "OPEN",
+    };
+  }
+
+  private async recordOwnership(entry: {
+    paperPositionId: string;
+    symbol: string;
+    side: "long" | "short";
+    requestedAmount: number;
+    filledAmount: number;
+    closedAmount: number;
+    averagePrice: number | null;
+    orderId: string | null;
+    status: "OPEN" | "CLOSED" | "UNVERIFIED";
+    now: number;
+  }): Promise<void> {
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, average_price, order_id, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (paper_position_id) DO UPDATE SET
+           requested_amount = excluded.requested_amount,
+           filled_amount = excluded.filled_amount,
+           closed_amount = excluded.closed_amount,
+           average_price = excluded.average_price,
+           order_id = excluded.order_id,
+           status = excluded.status,
+           updated_at = excluded.updated_at`,
+        [
+          entry.paperPositionId,
+          entry.symbol,
+          entry.side,
+          entry.requestedAmount,
+          entry.filledAmount,
+          entry.closedAmount,
+          entry.averagePrice,
+          entry.orderId,
+          entry.status,
+          entry.now,
+          entry.now,
+        ],
+      ),
+    );
+  }
+
+  private async markOwnershipClosed(
+    paperPositionId: string,
+    _reason: string,
+  ): Promise<void> {
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `UPDATE lighter_owned_positions
+         SET closed_amount = filled_amount, status = 'CLOSED', updated_at = ?
+         WHERE paper_position_id = ?`,
+        [this.now(), paperPositionId],
+      ),
+    );
+  }
+
+  /** Closes every position the registry proves the bot owns. */
+  private async flattenOwned(action: ExecutionAction): Promise<void> {
+    const owned = (await this.listOwnership()).filter(
+      (entry) =>
+        entry.status === "OPEN" &&
+        entry.filledAmount - entry.closedAmount > OWNERSHIP_EPSILON,
+    );
+
+    for (const entry of owned) {
+      const remaining = entry.filledAmount - entry.closedAmount;
+      const held = (await this.positionsFor(entry.symbol)).find(
+        (position) => position.side === entry.side,
+      );
+
+      if (!held) {
+        await this.markOwnershipClosed(entry.paperPositionId, action);
+        continue;
+      }
+
+      const amount = Math.min(remaining, Math.abs(held.contracts));
+      if (!(amount > OWNERSHIP_EPSILON)) continue;
+
+      const side = entry.side === "long" ? "sell" : "buy";
+      const price = await this.worstPrice(entry.symbol, side);
+      if (price === null) {
+        this.log(
+          `[EXEC] ${action} ${entry.symbol} skipped: no usable ${side} price`,
+        );
+        continue;
+      }
+
+      const order = await this.adapter.createOrder({
+        symbol: entry.symbol,
+        type: "market",
+        side,
+        amount,
+        price,
+        reduceOnly: true,
+      });
+
+      const reference = orderReference(order);
+      await this.record({
+        paperPositionId: entry.paperPositionId,
+        action,
+        symbol: entry.symbol,
+        side,
+        amount,
+        price,
+        orderId: reference,
+        status: orderAuditStatus(order),
+        requestedAmount: amount,
+        filledAmount: amount,
+        remainingAmount: Math.max(0, remaining - amount),
+        averagePrice: order.price ?? price,
+        txHash: reference,
+      });
+
+      this.log(
+        `[EXEC] ${action} ${entry.symbol} ${side.toUpperCase()} ${amount} ` +
+          `(reduce only) | paper ${entry.paperPositionId} ` +
+          `| order ${reference ?? "?"} ${orderAuditStatus(order)}`,
+      );
+
+      const stillOpen = await this.verifyClosed(entry.symbol, entry.side);
+      if (!stillOpen) {
+        await this.markOwnershipClosed(entry.paperPositionId, action);
+      }
+    }
+  }
+
+  private async readRows(
+    sql: string,
+    params: unknown[] = [],
+  ): Promise<Array<Record<string, unknown>>> {
+    return withSerializedDatabaseOperation(async () => {
+      const result = await this.connection.runAndReadAll(sql, params as any[]);
+      return result.getRowObjects() as Array<Record<string, unknown>>;
+    });
   }
 
   private enqueue(task: () => Promise<void>, label: string): void {
@@ -616,8 +1154,8 @@ export class LighterExecutionBridge {
   }
 
   private async ensureAuditTable(): Promise<void> {
-    await withSerializedDatabaseOperation(() =>
-      this.connection.run(`
+    await withSerializedDatabaseOperation(async () => {
+      await this.connection.run(`
         CREATE TABLE IF NOT EXISTS lighter_executions (
           id VARCHAR PRIMARY KEY,
           paper_position_id VARCHAR NOT NULL,
@@ -631,8 +1169,39 @@ export class LighterExecutionBridge {
           error VARCHAR,
           created_at BIGINT NOT NULL
         )
-      `),
-    );
+      `);
+
+      // Fill-level columns were added after the first testnet run; the
+      // migration keeps existing local databases usable.
+      for (const column of [
+        "requested_amount DOUBLE",
+        "filled_amount DOUBLE",
+        "remaining_amount DOUBLE",
+        "average_price DOUBLE",
+        "tx_hash VARCHAR",
+      ]) {
+        await this.connection.run(
+          `ALTER TABLE lighter_executions ADD COLUMN IF NOT EXISTS ${column}`,
+        );
+      }
+
+      // Ownership is the only proof that a venue position may be closed.
+      await this.connection.run(`
+        CREATE TABLE IF NOT EXISTS lighter_owned_positions (
+          paper_position_id VARCHAR PRIMARY KEY,
+          symbol VARCHAR NOT NULL,
+          side VARCHAR NOT NULL,
+          requested_amount DOUBLE NOT NULL,
+          filled_amount DOUBLE NOT NULL,
+          closed_amount DOUBLE NOT NULL,
+          average_price DOUBLE,
+          order_id VARCHAR,
+          status VARCHAR NOT NULL,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
+        )
+      `);
+    });
   }
 
   private async record(entry: {
@@ -645,13 +1214,19 @@ export class LighterExecutionBridge {
     orderId: string | null;
     status: string;
     error?: string | null;
+    requestedAmount?: number;
+    filledAmount?: number;
+    remainingAmount?: number;
+    averagePrice?: number | null;
+    txHash?: string | null;
   }): Promise<void> {
     await withSerializedDatabaseOperation(() =>
       this.connection.run(
         `INSERT INTO lighter_executions
          (id, paper_position_id, action, symbol, side, amount, price, order_id,
-          status, error, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          status, error, created_at, requested_amount, filled_amount,
+          remaining_amount, average_price, tx_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           crypto.randomUUID(),
           entry.paperPositionId,
@@ -664,6 +1239,11 @@ export class LighterExecutionBridge {
           entry.status,
           entry.error ?? null,
           this.now(),
+          entry.requestedAmount ?? null,
+          entry.filledAmount ?? null,
+          entry.remainingAmount ?? null,
+          entry.averagePrice ?? null,
+          entry.txHash ?? null,
         ],
       ),
     );

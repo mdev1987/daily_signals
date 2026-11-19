@@ -313,6 +313,27 @@ async function latestPrice(connection: DatabaseConnection, symbol: string): Prom
   return { price, high: asNumber(result[0]!.high), low: asNumber(result[0]!.low), closeTime, canonicalSymbol };
 }
 
+/**
+ * Newest stored price for a symbol, even if it is older than the freshness cut
+ * used for trading. Only the week-end liquidation uses this: leaving a mirrored
+ * position open is worse than valuing it on the last known candle.
+ */
+async function lastStoredPrice(
+  connection: DatabaseConnection,
+  symbol: string,
+): Promise<number | null> {
+  const canonicalSymbol = await resolveCanonicalSymbol(symbol);
+  const result = await rows(
+    connection,
+    `SELECT close FROM price_candles
+     WHERE symbol = ? AND timeframe = ?
+     ORDER BY open_time DESC LIMIT 1`,
+    [canonicalSymbol, PHASE7_CONFIG.priceTimeframe],
+  );
+  const price = asNumber(result[0]?.close);
+  return Number.isFinite(price) && price > 0 ? price : null;
+}
+
 async function portfolio(connection: DatabaseConnection): Promise<{ balance: number; open: DbRow[] }> {
   const startingBalance = await getStateNumber(connection, "starting_balance");
   const closed = await rows(connection, "SELECT COALESCE(SUM(net_pnl), 0) AS pnl FROM paper_trades");
@@ -811,8 +832,26 @@ async function reportIfExpired(connection: DatabaseConnection): Promise<void> {
   await closeOnStops(connection, startedAt + PHASE7_CONFIG.durationMs);
   const stillOpen = await rows(connection, "SELECT * FROM paper_positions WHERE status = 'OPEN'");
   for (const position of stillOpen) {
-    const quote = await latestPrice(connection, String(position.symbol));
-    if (quote) await closePosition(connection, position, quote.price, "WEEK_END_LIQUIDATION");
+    const symbol = String(position.symbol);
+    const quote = await latestPrice(connection, symbol);
+
+    // The venue must not be left holding a position after the experiment
+    // ends. A stale candle is still better than an unprotected mirror, and the
+    // entry price is the last resort when no candle exists at all.
+    const fallback = quote?.price ?? (await lastStoredPrice(connection, symbol));
+    const price = fallback ?? asNumber(position.entry_price);
+    const reason = quote
+      ? "WEEK_END_LIQUIDATION"
+      : "WEEK_END_LIQUIDATION_STALE";
+
+    if (!quote) {
+      console.log(
+        `[PAPER] ${symbol} has no fresh quote at week end; liquidating at ` +
+          `${price} (${fallback ? "last stored candle" : "entry price"})`,
+      );
+    }
+
+    await closePosition(connection, position, price, reason);
   }
 
   const summary = await rows(connection, `

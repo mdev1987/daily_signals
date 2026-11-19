@@ -122,6 +122,21 @@ describe("Lighter configuration and order safety", () => {
     expect(config.privateApiEnvironment).toBe("mainnet");
   });
 
+  test("execution defaults stay closed and bounded", () => {
+    const config = loadLighterConfig({});
+
+    expect(config.execution.enabled).toBe(false);
+    expect(config.execution.sizeMultiplier).toBe(1);
+    expect(config.execution.maxNotionalUsd).toBe(0);
+    expect(config.execution.flattenOnShutdown).toBe(true);
+  });
+
+  test("rejects an invalid notional cap", () => {
+    expect(() =>
+      loadLighterConfig({ LIGHTER_MAX_NOTIONAL_USD: "-5" }),
+    ).toThrow(ExchangeConfigurationError);
+  });
+
   test("rejects unknown environments instead of guessing", () => {
     expect(() => loadLighterConfig({ LIGHTER_ENV: "staging" })).toThrow(
       ExchangeConfigurationError,

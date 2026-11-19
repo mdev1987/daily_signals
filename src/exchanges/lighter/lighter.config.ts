@@ -54,6 +54,18 @@ export interface LighterExecutionConfig {
    * below the venue's minimum order size. 1 mirrors the paper size exactly.
    */
   sizeMultiplier: number;
+  /**
+   * Hard cap on a single entry notional in USD. 0 disables the cap. The size
+   * multiplier must not be able to turn a small paper trade into an unbounded
+   * venue position.
+   */
+  maxNotionalUsd: number;
+  /**
+   * Close every bot-owned position when the process shuts down cleanly. There
+   * is no venue-side stop loss yet, so leaving a position open on SIGTERM
+   * would leave it unprotected. SIGKILL cannot run this policy.
+   */
+  flattenOnShutdown: boolean;
 }
 
 export interface LighterConfig {
@@ -303,6 +315,17 @@ function readExecutionConfig(
     );
   }
 
+  const maxNotionalUsd = readDecimal(
+    env.LIGHTER_MAX_NOTIONAL_USD,
+    0,
+    "LIGHTER_MAX_NOTIONAL_USD",
+  );
+  if (!(maxNotionalUsd >= 0) || !Number.isFinite(maxNotionalUsd)) {
+    throw new ExchangeConfigurationError(
+      "LIGHTER_MAX_NOTIONAL_USD must be zero or a positive number",
+    );
+  }
+
   return {
     enabled: readBoolean(env.LIGHTER_EXECUTION_ENABLED, false),
     leverage,
@@ -315,6 +338,8 @@ function readExecutionConfig(
     ),
     reconcileIntervalMs,
     sizeMultiplier,
+    maxNotionalUsd,
+    flattenOnShutdown: readBoolean(env.LIGHTER_FLATTEN_ON_SHUTDOWN, true),
   };
 }
 
