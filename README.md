@@ -633,9 +633,12 @@ is the registry, keyed by `paper_position_id`:
   `PENDING` and is reported, instead of being closed as never filled. Because
   venue positions are netted, a fill the duplicate already produced is credited
   to the existing owner before the duplicate is closed
-  (`filled_amount = closed_amount + owned`, with a quantity-weighted entry
-  price), so shutdown flattens the full size. A failed post-cancel read keeps
-  the duplicate `PENDING`.
+  (`filled_amount = closed_amount + owned`), so shutdown flattens the full
+  size. The venue entry price is the average of the whole netted position, so a
+  sole owner simply adopts it; with several owners the incremental fill price is
+  derived from the venue notional minus the other claims, and if that cannot be
+  derived reliably `average_price` is cleared instead of invented. A failed
+  post-cancel read keeps the duplicate `PENDING`.
 - The reconciler walks symbols from the registry as well as the config, so
   removing a symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand an owned
   position.

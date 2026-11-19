@@ -560,7 +560,7 @@ describe("Lighter bridge shutdown and leverage guard", () => {
 async function ownershipOf(connection: any, id = "p1") {
   const result = await connection.runAndReadAll(
     `SELECT status, confirmation, filled_amount, closed_amount,
-            bot_closed_amount, external_closed_amount
+            bot_closed_amount, external_closed_amount, average_price
      FROM lighter_owned_positions WHERE paper_position_id = ?`,
     [id],
   );
@@ -572,6 +572,7 @@ async function ownershipOf(connection: any, id = "p1") {
         closed_amount: number;
         bot_closed_amount: number;
         external_closed_amount: number;
+        average_price: number | null;
       }
     | undefined;
 }
@@ -1449,6 +1450,106 @@ describe("Lighter bridge post-cancel accounting", () => {
     expect(a.positions).toHaveLength(0);
     expect(a.orders.at(-1)).toMatchObject({ amount: 0.001, reduceOnly: true });
     expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+  });
+
+  test("single-owner duplicate credit uses the aggregate venue entry price", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES ('p8', ?, 'long', 0.001, 0.0005, 0, 0, 0, 0, 100000,
+               NULL, 'OPEN', 'CONFIRMED', 1, 1)`,
+      [SYMBOL],
+    );
+
+    const owner = (await (bridge as any).listOwnership()).find(
+      (row: any) => row.paperPositionId === "p8",
+    );
+    await (bridge as any).attributeDuplicateFill([owner], 0.001, 105_000);
+
+    const row = await ownershipOf(connection, "p8");
+    expect(row?.filled_amount).toBeCloseTo(0.001, 9);
+    // The venue price is already the average for the full 0.001 position.
+    // Blending it with the old 100,000 average again would produce 102,500.
+    expect(row?.average_price).toBeCloseTo(105_000, 6);
+  });
+
+  test("multi-owner duplicate credit derives the incremental fill price", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES
+         ('p10', ?, 'long', 0.001, 0.0005, 0, 0, 0, 0, 100000,
+          NULL, 'OPEN', 'CONFIRMED', 1, 1),
+         ('p11', ?, 'long', 0.001, 0.0005, 0, 0, 0, 0, 110000,
+          NULL, 'OPEN', 'CONFIRMED', 2, 2)`,
+      [SYMBOL, SYMBOL],
+    );
+
+    const owners = (await (bridge as any).listOwnership()).filter(
+      (row: any) =>
+        row.paperPositionId === "p10" || row.paperPositionId === "p11",
+    );
+    // Existing claims have notional 105 over 0.001. A 0.0005 excess at
+    // 120,000 produces a 0.0015 aggregate position at 110,000.
+    const added = await (bridge as any).attributeDuplicateFill(
+      owners,
+      0.0015,
+      110_000,
+    );
+
+    expect(added).toBeCloseTo(0.0005, 9);
+    const first = await ownershipOf(connection, "p10");
+    const second = await ownershipOf(connection, "p11");
+    expect(first?.filled_amount).toBeCloseTo(0.001, 9);
+    expect(first?.average_price).toBeCloseTo(110_000, 6);
+    expect(second?.filled_amount).toBeCloseTo(0.0005, 9);
+    expect(second?.average_price).toBeCloseTo(110_000, 6);
+  });
+
+  test("duplicate credit clears the average price when it cannot be derived", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES
+         ('p12', ?, 'long', 0.001, 0.0005, 0, 0, 0, 0, NULL,
+          NULL, 'OPEN', 'CONFIRMED', 1, 1),
+         ('p13', ?, 'long', 0.001, 0.0005, 0, 0, 0, 0, 110000,
+          NULL, 'OPEN', 'CONFIRMED', 2, 2)`,
+      [SYMBOL, SYMBOL],
+    );
+
+    const owners = (await (bridge as any).listOwnership()).filter(
+      (row: any) =>
+        row.paperPositionId === "p12" || row.paperPositionId === "p13",
+    );
+    const added = await (bridge as any).attributeDuplicateFill(
+      owners,
+      0.0015,
+      110_000,
+    );
+
+    expect(added).toBeCloseTo(0.0005, 9);
+    const row = await ownershipOf(connection, "p12");
+    expect(row?.filled_amount).toBeCloseTo(0.001, 9);
+    expect(row?.average_price).toBeNull();
   });
 
   test("duplicate credit keeps filled = closed + owned for a partially closed owner", async () => {

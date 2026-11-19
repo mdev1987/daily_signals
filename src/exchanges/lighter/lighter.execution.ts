@@ -1114,7 +1114,15 @@ export class LighterExecutionBridge {
 
     // Normal case: one active owner on the side. If several claim it, the
     // largest remaining claim absorbs the excess so the aggregate still matches.
-    const owner = owners.reduce((largest, candidate) =>
+    const liveOwners = owners.filter(
+      (candidate) =>
+        candidate.filledAmount - candidate.closedAmount > OWNERSHIP_EPSILON,
+    );
+    // Every live claim is already filtered by the caller; this only guards the
+    // reduce below if a zero-size row is passed in.
+    if (liveOwners.length === 0) return 0;
+
+    const owner = liveOwners.reduce((largest, candidate) =>
       candidate.filledAmount - candidate.closedAmount >
       largest.filledAmount - largest.closedAmount
         ? candidate
@@ -1123,14 +1131,46 @@ export class LighterExecutionBridge {
     const owned = Math.max(0, owner.filledAmount - owner.closedAmount);
     const newOwned = owned + excess;
 
-    let averagePrice = owner.averagePrice;
-    if (venueEntryPrice !== null) {
-      averagePrice =
-        owner.averagePrice !== null &&
-        Number.isFinite(owner.averagePrice) &&
-        owned > OWNERSHIP_EPSILON
-          ? (owner.averagePrice * owned + venueEntryPrice * excess) / newOwned
-          : venueEntryPrice;
+    // CCXT's Position.entryPrice is the average entry price of the entire
+    // netted venue position, not the price of only the newly credited excess.
+    // With one owner, that venue average is the correct updated owner average.
+    // With multiple owners, infer the incremental fill price by subtracting
+    // the known notional of all existing claims from the venue's total
+    // position notional. If that cannot be done reliably, clear the average
+    // rather than publish a fabricated one.
+    let averagePrice: number | null = null;
+    if (
+      venueEntryPrice !== null &&
+      Number.isFinite(venueEntryPrice) &&
+      venueEntryPrice > 0
+    ) {
+      if (liveOwners.length === 1) {
+        averagePrice = venueEntryPrice;
+      } else if (
+        liveOwners.every(
+          (candidate) =>
+            candidate.averagePrice !== null &&
+            Number.isFinite(candidate.averagePrice) &&
+            candidate.averagePrice > 0,
+        )
+      ) {
+        const existingNotional = liveOwners.reduce(
+          (total, candidate) =>
+            total +
+            (candidate.filledAmount - candidate.closedAmount) *
+              candidate.averagePrice!,
+          0,
+        );
+        const incrementalPrice =
+          (venueEntryPrice * venueSize - existingNotional) / excess;
+        if (Number.isFinite(incrementalPrice) && incrementalPrice > 0) {
+          averagePrice =
+            owner.averagePrice !== null && owned > OWNERSHIP_EPSILON
+              ? (owner.averagePrice * owned + incrementalPrice * excess) /
+                newOwned
+              : incrementalPrice;
+        }
+      }
     }
 
     const filledAmount = owner.closedAmount + newOwned;
