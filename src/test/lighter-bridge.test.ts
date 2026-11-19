@@ -1411,6 +1411,112 @@ describe("Lighter bridge post-cancel accounting", () => {
     expect(text).toContain("could not cancel working order o9");
   });
 
+  test("a duplicate fill is credited to the existing owner, then flattened", async () => {
+    const a = fakeAdapter({ fillRatio: 0.5, extraFillOnCancel: 0.0005 });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    expect((await ownershipOf(connection))?.filled_amount).toBeCloseTo(0.0005, 9);
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES ('p3', ?, 'long', 0.001, 0, 0, 0, 0, 0, 100000, 'o9', 'PENDING',
+               'INTENT', 1, 1)`,
+      [SYMBOL],
+    );
+
+    a.options.openOrders = [
+      { id: "o9", symbol: SYMBOL, side: "buy", amount: 0.0005 },
+    ];
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    // The cancel races a duplicate fill into the netted venue position.
+    expect(a.positions[0]?.contracts).toBeCloseTo(0.001, 9);
+    expect((await ownershipOf(connection))?.filled_amount).toBeCloseTo(0.001, 9);
+    expect(await ownershipOf(connection, "p3")).toMatchObject({
+      status: "CLOSED",
+      confirmation: "FAILED",
+    });
+    expect(logs.join("\n")).toContain("credited 0.0005 long");
+
+    await bridge.close();
+    expect(a.positions).toHaveLength(0);
+    expect(a.orders.at(-1)).toMatchObject({ amount: 0.001, reduceOnly: true });
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+  });
+
+  test("duplicate credit keeps filled = closed + owned for a partially closed owner", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES ('p9', ?, 'long', 0.001, 0.0005, 0.0004, 0.0004, 0, 0, 100000,
+               NULL, 'OPEN', 'CONFIRMED', 1, 1)`,
+      [SYMBOL],
+    );
+
+    const owner = (await (bridge as any).listOwnership()).find(
+      (row: any) => row.paperPositionId === "p9",
+    );
+    const added = await (bridge as any).attributeDuplicateFill(
+      [owner],
+      0.001,
+      110_000,
+    );
+
+    expect(added).toBeCloseTo(0.0009, 9);
+    const row = await ownershipOf(connection, "p9");
+    expect(row?.closed_amount).toBeCloseTo(0.0004, 9);
+    expect(row?.filled_amount).toBeCloseTo(0.0014, 9);
+    expect((row?.filled_amount ?? 0) - (row?.closed_amount ?? 0)).toBeCloseTo(
+      0.001,
+      9,
+    );
+  });
+
+  test("a duplicate stays PENDING when the post-cancel read fails", async () => {
+    const a = fakeAdapter({ fillRatio: 0.5, positionsErrorAfterCancel: true });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES ('p3', ?, 'long', 0.001, 0, 0, 0, 0, 0, 100000, 'o9', 'PENDING',
+               'INTENT', 1, 1)`,
+      [SYMBOL],
+    );
+
+    a.options.openOrders = [
+      { id: "o9", symbol: SYMBOL, side: "buy", amount: 0.0005 },
+    ];
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect(await ownershipOf(connection, "p3")).toMatchObject({
+      status: "PENDING",
+      confirmation: "INTENT",
+    });
+    expect((await ownershipOf(connection))?.filled_amount).toBeCloseTo(0.0005, 9);
+    expect(logs.join("\n")).toContain("could not be re-read after cancelling");
+  });
+
   test("a failed post-cancel read keeps ownership UNRESOLVED", async () => {
     const a = fakeAdapter({
       fillRatio: 0.5,

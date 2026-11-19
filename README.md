@@ -630,7 +630,12 @@ is the registry, keyed by `paper_position_id`:
   size.
 - A duplicate pending intent is never discarded while its entry order can still
   run. The order is cancelled and verified first; if that fails the intent stays
-  `PENDING` and is reported, instead of being closed as never filled.
+  `PENDING` and is reported, instead of being closed as never filled. Because
+  venue positions are netted, a fill the duplicate already produced is credited
+  to the existing owner before the duplicate is closed
+  (`filled_amount = closed_amount + owned`, with a quantity-weighted entry
+  price), so shutdown flattens the full size. A failed post-cancel read keeps
+  the duplicate `PENDING`.
 - The reconciler walks symbols from the registry as well as the config, so
   removing a symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand an owned
   position.

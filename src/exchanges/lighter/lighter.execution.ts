@@ -964,19 +964,24 @@ export class LighterExecutionBridge {
   /**
    * Resolves one durable entry intent from venue state.
    *
+   * `owners` are the rows that already claim this symbol and side. The venue
+   * position is netted, so a duplicate intent can have filled into the same
+   * aggregate position; those fills are credited to the existing owner before
+   * the duplicate is discarded.
+   *
    * ADOPTED    = the venue holds a position; ownership is claimed at the
    *              post-cancel venue size.
    * WORKING    = a resting order exists, keep waiting.
    * UNFILLED   = no position and no order, the entry never happened.
-   * DUPLICATE  = another owned row already claims this side and the intent's
-   *              order has been cancelled.
+   * DUPLICATE  = another owned row already claims this side; the intent's order
+   *              was cancelled and any fill it added was credited to the owner.
    * UNRESOLVED = the venue could not be re-read after the cancel; keep the
    *              intent PENDING instead of discarding the trail.
    */
   private async resolvePendingOwnership(
     entry: OwnedVenuePosition,
     venue: Position[],
-    claimedByAnother: boolean,
+    owners: OwnedVenuePosition[],
   ): Promise<{
     row: OwnedVenuePosition | null;
     outcome: "ADOPTED" | "WORKING" | "UNFILLED" | "DUPLICATE" | "UNRESOLVED";
@@ -995,15 +1000,10 @@ export class LighterExecutionBridge {
         return { row: null, outcome: "WORKING" };
       }
 
-      if (claimedByAnother) {
-        await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
-        await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
-        return { row: null, outcome: "DUPLICATE" };
-      }
-
       // The cancel is not instantaneous: the remainder can fill while it is in
       // flight. Re-read the venue so ownership records the final size rather
-      // than the pre-cancel snapshot.
+      // than the pre-cancel snapshot. This read is shared by the duplicate and
+      // adoption paths.
       let refreshed: Position[];
       try {
         refreshed = await this.positionsFor(entry.symbol);
@@ -1016,28 +1016,54 @@ export class LighterExecutionBridge {
         return { row: null, outcome: "UNRESOLVED" };
       }
 
-      const after = refreshed.find(
+      const sidePositions = refreshed.filter(
         (position) =>
           position.side === entry.side &&
           Math.abs(position.contracts) > OWNERSHIP_EPSILON,
       );
+      const venueSize = sidePositions.reduce(
+        (total, position) => total + Math.abs(position.contracts),
+        0,
+      );
+      const venueEntryPrice =
+        sidePositions.length > 0 && Number.isFinite(sidePositions[0]!.entryPrice)
+          ? sidePositions[0]!.entryPrice
+          : null;
 
-      if (!after) {
+      if (owners.length > 0) {
+        // Netted position: the duplicate may already have filled into the same
+        // aggregate size. Credit that size to the existing owner before the
+        // duplicate row is closed, or the excess would become unmanaged.
+        const added = await this.attributeDuplicateFill(
+          owners,
+          venueSize,
+          venueEntryPrice,
+        );
+        if (added > OWNERSHIP_EPSILON) {
+          this.log(
+            `[EXEC] ${entry.symbol} credited ${added} ${entry.side} from ` +
+              `duplicate paper ${entry.paperPositionId} to existing ownership`,
+          );
+        }
+
+        await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
+        await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
+        return { row: null, outcome: "DUPLICATE" };
+      }
+
+      if (!(venueSize > OWNERSHIP_EPSILON)) {
         await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
         await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
         return { row: null, outcome: "UNFILLED" };
       }
 
-      const size = Math.abs(after.contracts);
-      const entryPrice = Number.isFinite(after.entryPrice)
-        ? after.entryPrice
-        : entry.averagePrice;
-      await this.adoptOwnership(entry.paperPositionId, size, entryPrice);
+      const entryPrice = venueEntryPrice ?? entry.averagePrice;
+      await this.adoptOwnership(entry.paperPositionId, venueSize, entryPrice);
 
       return {
         row: {
           ...entry,
-          filledAmount: size,
+          filledAmount: venueSize,
           averagePrice: entryPrice,
           status: "OPEN",
           confirmation: "CONFIRMED",
@@ -1063,6 +1089,63 @@ export class LighterExecutionBridge {
     await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
     await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
     return { row: null, outcome: "UNFILLED" };
+  }
+
+  /**
+   * Credits size that appeared on the venue after a duplicate intent was
+   * recorded to the row that already owns that side.
+   *
+   * The venue nets positions, so cancelling a duplicate order does not undo a
+   * fill that already happened. The owner keeps its historical closes; only the
+   * live size grows, so `filled_amount = closed_amount + owned` still holds.
+   * Returns the credited quantity (0 when the venue shows no excess).
+   */
+  private async attributeDuplicateFill(
+    owners: OwnedVenuePosition[],
+    venueSize: number,
+    venueEntryPrice: number | null,
+  ): Promise<number> {
+    const totalOwned = owners.reduce(
+      (total, owner) => total + Math.max(0, owner.filledAmount - owner.closedAmount),
+      0,
+    );
+    const excess = venueSize - totalOwned;
+    if (!(excess > OWNERSHIP_EPSILON) || owners.length === 0) return 0;
+
+    // Normal case: one active owner on the side. If several claim it, the
+    // largest remaining claim absorbs the excess so the aggregate still matches.
+    const owner = owners.reduce((largest, candidate) =>
+      candidate.filledAmount - candidate.closedAmount >
+      largest.filledAmount - largest.closedAmount
+        ? candidate
+        : largest,
+    );
+    const owned = Math.max(0, owner.filledAmount - owner.closedAmount);
+    const newOwned = owned + excess;
+
+    let averagePrice = owner.averagePrice;
+    if (venueEntryPrice !== null) {
+      averagePrice =
+        owner.averagePrice !== null &&
+        Number.isFinite(owner.averagePrice) &&
+        owned > OWNERSHIP_EPSILON
+          ? (owner.averagePrice * owned + venueEntryPrice * excess) / newOwned
+          : venueEntryPrice;
+    }
+
+    const filledAmount = owner.closedAmount + newOwned;
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `UPDATE lighter_owned_positions
+         SET filled_amount = ?, average_price = ?, updated_at = ?
+         WHERE paper_position_id = ?`,
+        [filledAmount, averagePrice, this.now(), owner.paperPositionId],
+      ),
+    );
+
+    owner.filledAmount = filledAmount;
+    owner.averagePrice = averagePrice;
+    return excess;
   }
 
   /**
@@ -1185,14 +1268,10 @@ export class LighterExecutionBridge {
       // venue read throws above and leaves the intent PENDING, so nothing is
       // discarded when the endpoint is unavailable.
       for (const entry of pending.filter((row) => row.symbol === symbol)) {
-        const claimedByAnother = openOwned.some(
+        const owners = openOwned.filter(
           (row) => row.symbol === symbol && row.side === entry.side,
         );
-        const result = await this.resolvePendingOwnership(
-          entry,
-          venue,
-          claimedByAnother,
-        );
+        const result = await this.resolvePendingOwnership(entry, venue, owners);
 
         if (result.outcome === "ADOPTED") {
           this.log(
@@ -1937,26 +2016,27 @@ export class LighterExecutionBridge {
 
     // Shutdown must not leave a fill unowned merely because it was never
     // confirmed. Resolve intents from venue state before flattening.
-    const claimedSides = new Set(
-      registry
-        .filter(
-          (row) =>
-            (row.status === "OPEN" || row.status === "UNWIND_PENDING") &&
-            row.filledAmount - row.closedAmount > OWNERSHIP_EPSILON,
-        )
-        .map((row) => `${row.symbol}:${row.side}`),
-    );
+    const activeClaims = (): OwnedVenuePosition[] => {
+      const byId = new Map<string, OwnedVenuePosition>();
+      for (const row of [...registry, ...owned]) {
+        if (row.status !== "OPEN" && row.status !== "UNWIND_PENDING") continue;
+        if (!(row.filledAmount - row.closedAmount > OWNERSHIP_EPSILON)) continue;
+        byId.set(row.paperPositionId, row);
+      }
+      return [...byId.values()];
+    };
 
     for (const entry of registry.filter((row) => row.status === "PENDING")) {
       try {
-        const alreadyClaimed = claimedSides.has(`${entry.symbol}:${entry.side}`);
+        const owners = activeClaims().filter(
+          (row) => row.symbol === entry.symbol && row.side === entry.side,
+        );
         const result = await this.resolvePendingOwnership(
           entry,
           await this.positionsFor(entry.symbol),
-          alreadyClaimed,
+          owners,
         );
         if (result.outcome === "ADOPTED" && result.row) {
-          claimedSides.add(`${entry.symbol}:${entry.side}`);
           owned.push(result.row);
           this.log(
             `[EXEC] ${action} resolved pending entry ${entry.paperPositionId} ` +
@@ -1992,10 +2072,11 @@ export class LighterExecutionBridge {
         const after = await this.resolvePendingOwnership(
           entry,
           await this.positionsFor(entry.symbol),
-          alreadyClaimed,
+          activeClaims().filter(
+            (row) => row.symbol === entry.symbol && row.side === entry.side,
+          ),
         );
         if (after.outcome === "ADOPTED" && after.row) {
-          claimedSides.add(`${entry.symbol}:${entry.side}`);
           owned.push(after.row);
           this.log(
             `[EXEC] ${action} pending entry ${entry.paperPositionId} on ` +
