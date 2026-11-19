@@ -229,9 +229,12 @@ configured Lighter account. Paper trading remains authoritative:
   margin reserved by the venue.
 - A paper exit becomes a **reduce-only** market order, so a duplicated close
   can never flip the position.
-- `LIGHTER_EXECUTION_SYMBOLS` limits mirroring to markets the venue lists.
-  Lighter testnet has BTC, ETH and SOL; every other paper symbol stays
-  simulation-only.
+- `LIGHTER_EXECUTION_SYMBOLS` is optional. Left empty, the bridge mirrors every
+  perpetual the execution deployment lists and resolves each paper symbol
+  against the venue's market list (`BTC/USD` -> `BTC`, `EUR/USD` -> `EURUSD`,
+  `XAUUSD` -> `XAU`). Set it to a comma-separated list to narrow the mirror.
+  Testnet lists BTC, ETH and SOL; mainnet also lists FX, gold and silver,
+  equities and indices.
 - A queued reconciler closes venue positions that no longer exist in the paper
   book, which covers a crash between the paper commit and the venue order.
 
@@ -328,7 +331,7 @@ LIGHTER_TESTNET_BASE_URL=https://api.testnet.lighter.xyz
 LIGHTER_EXECUTION_ENABLED=false
 LIGHTER_LEVERAGE=5
 LIGHTER_MARGIN_MODE=cross
-LIGHTER_EXECUTION_SYMBOLS=BTC,ETH
+LIGHTER_EXECUTION_SYMBOLS=
 LIGHTER_SIZE_MULTIPLIER=1
 LIGHTER_MAX_NOTIONAL_USD=100
 LIGHTER_FLATTEN_ON_SHUTDOWN=true
@@ -537,10 +540,10 @@ protection and validation are enforced in code and by the primary key.
   and keys then return `29404 not found` even though the same index may still
   exist on the docs deployment. Recreate the account and key; no code change is
   required.
-- **Lighter reconcile scope:** orphan positions are reconciled for symbols in
-  `LIGHTER_EXECUTION_SYMBOLS` and for every symbol in the ownership registry.
-  Removing a configured symbol does not strand a position the bot already owns,
-  but a manual or external position is never closed.
+- **Lighter reconcile scope:** the reconciler walks every symbol in the
+  ownership registry plus any explicitly configured symbols, so removing a
+  symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand a position the bot
+  already owns, and a manual or external position is never closed.
 - **Lighter order price:** every order, including a market order, carries a
   price — it is the worst acceptable execution price, so it cannot be omitted.
 - **Lighter funding history:** `/api/v1/fundings` reports 1h or 1d entries with

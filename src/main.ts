@@ -238,7 +238,11 @@ async function startLighterExecution(): Promise<LighterExecutionBridge | null> {
     console.log(
       ` Lighter futures execution: ${config.execution.leverage}x ` +
         `${config.execution.marginMode} on ${config.privateApiEnvironment} ` +
-        `(${config.execution.symbols.join(", ")})`,
+        `(${
+          config.execution.symbols === null
+            ? "all listed markets"
+            : config.execution.symbols.join(", ")
+        })`,
     );
     return bridge;
   } catch (error) {

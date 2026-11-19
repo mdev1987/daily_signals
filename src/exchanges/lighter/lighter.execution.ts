@@ -13,8 +13,10 @@ import {
   type LighterConfig,
 } from "./lighter.config";
 import {
+  buildLighterMarketIndex,
   floorToAmountStep,
-  toLighterPerpetualSymbol,
+  resolveLighterMarket,
+  type LighterMarketIndex,
 } from "./lighter.market-mapper";
 
 /**
@@ -108,6 +110,13 @@ const OWNERSHIP_EPSILON = 1e-9;
 /** Attempts for a shutdown flatten, with a pause between them. */
 const SHUTDOWN_FLATTEN_ATTEMPTS = 3;
 
+/**
+ * Applying leverage is one signed transaction per market. Pre-apply it at
+ * startup while the mirror set is small (testnet lists a handful); a large
+ * venue universe is set lazily on each market's first order.
+ */
+const LEVERAGE_PREWARM_LIMIT = 10;
+
 /** Audit status for one closing order, based on observed fills. */
 export type CloseFillStatus =
   | "FILLED"
@@ -186,12 +195,18 @@ export function worstAcceptablePrice(
   return reference * factor;
 }
 
-/** True when a venue position belongs to the symbols this bridge manages. */
+/**
+ * True when a venue position belongs to a market this bridge may mirror.
+ * Membership comes from the venue's own market list, so a new Lighter listing
+ * becomes tradable without a code change.
+ */
 export function isManagedVenueSymbol(
   symbol: string,
-  supportedBases: readonly string[],
+  index: LighterMarketIndex,
+  allowed: ReadonlySet<string> | null = null,
 ): boolean {
-  return toLighterPerpetualSymbol(symbol, supportedBases) !== null;
+  if (!index.bySymbol.has(symbol)) return false;
+  return allowed === null || allowed.has(symbol);
 }
 
 /**
@@ -225,7 +240,9 @@ export class LighterExecutionBridge {
 
   private queue: Promise<void> = Promise.resolve();
   private leverageApplied = new Set<string>();
-  private markets: MarketInfo[] | null = null;
+  private index: LighterMarketIndex | null = null;
+  /** Venue symbols this bridge may touch; null means every listed perpetual. */
+  private allowed: Set<string> | null = null;
   private lastReconcile = 0;
   private missingLogged = new Set<string>();
 
@@ -268,21 +285,39 @@ export class LighterExecutionBridge {
         `leverage ${this.config.execution.leverage}x ${this.config.execution.marginMode}`,
     );
 
-    for (const base of this.config.execution.symbols) {
-      const symbol = this.toVenueSymbol(base);
-      if (!symbol) continue;
+    const index = await this.venueIndex();
+    const listed = index.bySymbol.size;
+    const mirrored = this.allowed === null ? listed : this.allowed.size;
 
-      // Fail closed: `assertStopBeforeLiquidation()` and the margin check both
-      // assume the requested leverage is actually applied. Refusing to start is
-      // safer than trading at an unknown account leverage.
-      try {
-        await this.ensureLeverage(symbol);
-      } catch (error) {
-        throw new ExchangeConfigurationError(
-          `Could not set ${this.config.execution.leverage}x on ${symbol}: ` +
-            this.adapter.redact(error),
-        );
+    this.log(
+      `[EXEC] venue lists ${listed} perpetual${listed === 1 ? "" : "s"} | ` +
+        `mirroring ${mirrored}` +
+        (this.config.execution.symbols === null
+          ? " (every listed market)"
+          : ` (${this.config.execution.symbols.join(", ")})`),
+    );
+
+    const targets = [...(this.allowed ?? index.bySymbol.keys())];
+
+    if (targets.length <= LEVERAGE_PREWARM_LIMIT) {
+      for (const symbol of targets) {
+        // Fail closed: `assertStopBeforeLiquidation()` and the margin check both
+        // assume the requested leverage is actually applied. Refusing to start
+        // is safer than trading at an unknown account leverage.
+        try {
+          await this.ensureLeverage(symbol);
+        } catch (error) {
+          throw new ExchangeConfigurationError(
+            `Could not set ${this.config.execution.leverage}x on ${symbol}: ` +
+              this.adapter.redact(error),
+          );
+        }
       }
+    } else {
+      this.log(
+        `[EXEC] leverage ${this.config.execution.leverage}x is applied per ` +
+          `market on its first order (${targets.length} mirrored markets)`,
+      );
     }
   }
 
@@ -358,22 +393,23 @@ export class LighterExecutionBridge {
   // -------------------------------------------------------------------------
 
   private async mirrorOpen(position: PaperExecutionPosition): Promise<void> {
-    const symbol = this.toVenueSymbol(position.symbol);
-    if (!symbol) {
+    const market = await this.resolveMarket(position.symbol);
+    if (!market) {
+      const scope =
+        this.allowed === null ? "" : " inside LIGHTER_EXECUTION_SYMBOLS";
       this.log(
-        `[EXEC] ${position.symbol} is not executable on Lighter ` +
-          `(${this.config.execution.symbols.join(", ")}); paper only`,
+        `[EXEC] ${position.symbol} has no matching ` +
+          `${this.config.privateApiEnvironment} perpetual${scope}; paper only`,
       );
       return;
     }
 
+    const symbol = market.symbol;
     const side = position.direction === "long" ? "buy" : "sell";
     let amount = 0;
     let price: number | null = null;
 
     try {
-      const market = await this.market(symbol);
-
       // A duplicate open event must never add to an already-owned position.
       const alreadyOwned = await this.loadOwnership(position.id);
       if (alreadyOwned && alreadyOwned.status !== "CLOSED") {
@@ -851,9 +887,15 @@ export class LighterExecutionBridge {
     position: PaperExecutionPosition,
     exitReason: string,
   ): Promise<void> {
-    const symbol = this.toVenueSymbol(position.symbol);
-    if (!symbol) return;
+    const market = await this.resolveMarket(position.symbol);
+    if (!market) {
+      this.log(
+        `[EXEC] CLOSE ${position.symbol} skipped: no matching venue market`,
+      );
+      return;
+    }
 
+    const symbol = market.symbol;
     const fallbackSide = position.direction === "long" ? "sell" : "buy";
     let side: "buy" | "sell" = fallbackSide;
     let amount = 0;
@@ -1290,11 +1332,17 @@ export class LighterExecutionBridge {
 
     // Symbols come from the ownership registry as well as the current config,
     // so removing a symbol from LIGHTER_EXECUTION_SYMBOLS cannot strand a
-    // position the bot already opened.
+    // position the bot already opened. With the full venue universe the
+    // registry alone drives reconciliation, avoiding one venue read per listed
+    // market on every interval.
     const symbols = new Set<string>();
-    for (const base of this.config.execution.symbols) {
-      const symbol = this.toVenueSymbol(base);
-      if (symbol) symbols.add(symbol);
+    const index = await this.venueIndex();
+
+    if (this.config.execution.symbols !== null) {
+      for (const entry of this.config.execution.symbols) {
+        const market = resolveLighterMarket(entry, index);
+        if (market) symbols.add(market.symbol);
+      }
     }
     for (const entry of openOwned) symbols.add(entry.symbol);
     for (const entry of pending) symbols.add(entry.symbol);
@@ -1500,8 +1548,47 @@ export class LighterExecutionBridge {
   // Helpers
   // -------------------------------------------------------------------------
 
-  private toVenueSymbol(symbol: string): string | null {
-    return toLighterPerpetualSymbol(symbol, this.config.execution.symbols);
+  /** Loads the venue market list once and applies the optional allow-list. */
+  private async venueIndex(): Promise<LighterMarketIndex> {
+    if (this.index) return this.index;
+
+    const markets = await this.adapter.getMarkets();
+    const index = buildLighterMarketIndex(markets);
+    this.index = index;
+
+    const configured = this.config.execution.symbols;
+    if (configured !== null) {
+      const allowed = new Set<string>();
+      const unresolved: string[] = [];
+
+      for (const entry of configured) {
+        const market = resolveLighterMarket(entry, index);
+        if (market) allowed.add(market.symbol);
+        else unresolved.push(entry);
+      }
+
+      this.allowed = allowed;
+
+      if (unresolved.length > 0) {
+        this.log(
+          `[EXEC] not listed on ${this.config.privateApiEnvironment}, left ` +
+            `paper-only: ${unresolved.join(", ")}`,
+        );
+      }
+    }
+
+    return index;
+  }
+
+  /** Resolves a paper symbol to a mirrorable venue market, or null. */
+  private async resolveMarket(symbol: string): Promise<MarketInfo | null> {
+    const index = await this.venueIndex();
+    const market = resolveLighterMarket(symbol, index);
+    if (!market) return null;
+
+    return isManagedVenueSymbol(market.symbol, index, this.allowed)
+      ? market
+      : null;
   }
 
   private async ensureLeverage(symbol: string): Promise<void> {
@@ -1517,19 +1604,6 @@ export class LighterExecutionBridge {
       `[EXEC] ${symbol} leverage set to ${this.config.execution.leverage}x ` +
         `${this.config.execution.marginMode}`,
     );
-  }
-
-  private async market(symbol: string): Promise<MarketInfo> {
-    if (!this.markets) {
-      this.markets = await this.adapter.getMarkets();
-    }
-
-    const market = this.markets.find((candidate) => candidate.symbol === symbol);
-    if (!market) {
-      throw new Error(`Lighter market ${symbol} is not available on this deployment`);
-    }
-
-    return market;
   }
 
   private async worstPrice(

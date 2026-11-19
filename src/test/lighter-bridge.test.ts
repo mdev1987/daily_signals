@@ -21,6 +21,36 @@ const ENV = {
 
 const SYMBOL = "BTC/USDC:USDC";
 
+/** Minimal but complete MarketInfo so venue resolution accepts the fixture. */
+function fakeMarket(symbol: string, base: string, minAmount: number) {
+  return {
+    exchange: "lighter",
+    symbol,
+    exchangeSymbol: symbol,
+    base,
+    quote: "USDC",
+    settle: "USDC",
+    type: "swap",
+    linear: true,
+    inverse: false,
+    contract: true,
+    active: true,
+    contractSize: 1,
+    priceTick: 0.1,
+    amountStep: 0.0001,
+    minAmount,
+    maxAmount: null,
+    minCost: 10,
+    minLeverage: null,
+    maxLeverage: null,
+    initialMarginRate: null,
+    maintenanceMarginRate: null,
+    makerFee: null,
+    takerFee: null,
+    raw: {},
+  };
+}
+
 interface FakeOptions {
   positions?: any[];
   free?: number;
@@ -86,13 +116,8 @@ function fakeAdapter(opts: FakeOptions = {}) {
       baseUrl: "https://example.test",
     }),
     getMarkets: async () => [
-      { symbol: SYMBOL, amountStep: 0.0001, minAmount: 0.0002, minCost: 10 },
-      {
-        symbol: "ETH/USDC:USDC",
-        amountStep: 0.0001,
-        minAmount: 0.0002,
-        minCost: 10,
-      },
+      fakeMarket(SYMBOL, "BTC", 0.0002),
+      fakeMarket("ETH/USDC:USDC", "ETH", 0.0002),
     ],
     getBalance: async () =>
       opts.balanceAvailable === false

@@ -163,43 +163,75 @@ export function selectInitialUniverse(
   );
 }
 
-const USD_QUOTES = new Set(["USD", "USDC", "USDT"]);
+/** Strips separators so `BTC/USD`, `BTCUSD` and `btc-usd` compare equal. */
+export function normalizeLighterBase(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
 
 /**
- * Maps a signal-side or canonical symbol (`BTC/USD`, `BTCUSD`, `BTC`) to the
- * Lighter USDC perpetual the bot may trade. Anything outside the caller's
- * allow-list returns null so the position stays paper-only instead of being
- * forced onto the wrong contract.
+ * Lookup built from the venue's own market list. Lighter lists whatever it
+ * chooses to list (crypto, FX, metals, equities, indices) and changes it
+ * without notice, so symbols resolve against this index instead of a hardcoded
+ * universe.
  */
-export function toLighterPerpetualSymbol(
-  symbol: string,
-  supportedBases: readonly string[],
-): string | null {
-  const normalized = symbol.trim().toUpperCase().replace(/\s+/g, "");
-  if (!normalized) return null;
+export interface LighterMarketIndex {
+  /** Venue symbol, e.g. `EURUSD/USDC:USDC` -> market. */
+  bySymbol: Map<string, MarketInfo>;
+  /** Quote-stripped key, e.g. `EURUSD`, `BTC`, `XAU` -> market. */
+  byBase: Map<string, MarketInfo>;
+}
 
-  const allowed = new Set(
-    supportedBases.map((base) => base.trim().toUpperCase()).filter(Boolean),
-  );
-  const parts = normalized.split(/[/:_-]/).filter(Boolean);
+export function buildLighterMarketIndex(
+  markets: readonly MarketInfo[],
+): LighterMarketIndex {
+  const bySymbol = new Map<string, MarketInfo>();
+  const byBase = new Map<string, MarketInfo>();
 
-  let base = parts[0] ?? "";
+  for (const market of markets) {
+    if (!isEligibleLighterPerpetual(market)) continue;
 
-  if (parts.length >= 2) {
-    const quote = parts[parts.length - 1]!;
-    if (!USD_QUOTES.has(quote)) return null;
-  } else {
-    for (const suffix of ["USDC", "USDT", "USD"]) {
-      if (base.endsWith(suffix) && base.length > suffix.length) {
-        base = base.slice(0, -suffix.length);
-        break;
-      }
+    bySymbol.set(market.symbol, market);
+
+    const keys = [
+      normalizeLighterBase(market.base),
+      normalizeLighterBase(market.symbol.split("/")[0] ?? ""),
+    ];
+
+    for (const key of keys) {
+      if (key && !byBase.has(key)) byBase.set(key, market);
     }
   }
 
-  if (!base || !allowed.has(base)) return null;
+  return { bySymbol, byBase };
+}
 
-  return `${base}/USDC:USDC`;
+const QUOTE_SUFFIXES = ["USDC", "USDT", "USD"] as const;
+
+/**
+ * Resolves a signal-side or canonical symbol (`EUR/USD`, `XAUUSD`, `BTC`) to
+ * the venue market that represents it. Exact matches win, so `EURUSD` maps to
+ * the EURUSD perpetual rather than to anything with an EUR base. Only a quote
+ * suffix is peeled off, so `BTC/ZAR` never resolves to `BTC`.
+ */
+export function resolveLighterMarket(
+  symbol: string,
+  index: LighterMarketIndex,
+): MarketInfo | null {
+  const normalized = normalizeLighterBase(symbol);
+  if (!normalized) return null;
+
+  const direct = index.byBase.get(normalized);
+  if (direct) return direct;
+
+  for (const suffix of QUOTE_SUFFIXES) {
+    if (!normalized.endsWith(suffix)) continue;
+    if (normalized.length === suffix.length) continue;
+
+    const stripped = index.byBase.get(normalized.slice(0, -suffix.length));
+    if (stripped) return stripped;
+  }
+
+  return null;
 }
 
 /**

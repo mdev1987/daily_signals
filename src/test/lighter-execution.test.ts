@@ -1,15 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { ExchangeConfigurationError } from "../exchanges/exchange.errors";
-import type { OrderBook } from "../exchanges/exchange.types";
+import type { MarketInfo, OrderBook } from "../exchanges/exchange.types";
 import {
   assertLighterExecutionAllowed,
-  DEFAULT_EXECUTION_SYMBOLS,
   describeLighterConfig,
   loadLighterConfig,
 } from "../exchanges/lighter/lighter.config";
 import {
+  buildLighterMarketIndex,
   floorToAmountStep,
-  toLighterPerpetualSymbol,
+  normalizeLighterBase,
+  resolveLighterMarket,
 } from "../exchanges/lighter/lighter.market-mapper";
 import {
   isManagedVenueSymbol,
@@ -50,7 +51,7 @@ describe("Lighter futures execution configuration", () => {
     expect(config.execution.enabled).toBe(false);
     expect(config.execution.leverage).toBe(5);
     expect(config.execution.marginMode).toBe("cross");
-    expect(config.execution.symbols).toEqual([...DEFAULT_EXECUTION_SYMBOLS]);
+    expect(config.execution.symbols).toBeNull();
     expect(config.execution.allowMainnetExecution).toBe(false);
   });
 
@@ -88,8 +89,21 @@ describe("Lighter futures execution configuration", () => {
       loadLighterConfig({ LIGHTER_WORST_PRICE_SLIPPAGE_PCT: "25" }),
     ).toThrow(ExchangeConfigurationError);
     expect(() =>
-      loadLighterConfig({ LIGHTER_EXECUTION_SYMBOLS: " , " }),
+      loadLighterConfig({ LIGHTER_EXECUTION_SYMBOLS: "BTC,$$" }),
     ).toThrow(ExchangeConfigurationError);
+  });
+
+  test("an empty or wildcard symbol list mirrors every listed market", () => {
+    expect(loadLighterConfig({}).execution.symbols).toBeNull();
+    expect(
+      loadLighterConfig({ LIGHTER_EXECUTION_SYMBOLS: "" }).execution.symbols,
+    ).toBeNull();
+    expect(
+      loadLighterConfig({ LIGHTER_EXECUTION_SYMBOLS: "all" }).execution.symbols,
+    ).toBeNull();
+    expect(
+      loadLighterConfig({ LIGHTER_EXECUTION_SYMBOLS: "*" }).execution.symbols,
+    ).toBeNull();
   });
 
   test("execution requires every order gate", () => {
@@ -150,29 +164,99 @@ describe("Lighter futures execution configuration", () => {
   });
 });
 
-describe("Lighter execution symbol mapping", () => {
-  const supported = ["BTC", "ETH", "SOL"] as const;
+function venueMarket(
+  symbol: string,
+  base: string,
+  type: "swap" | "spot" = "swap",
+): MarketInfo {
+  return {
+    exchange: "lighter",
+    symbol,
+    exchangeSymbol: symbol,
+    base,
+    quote: "USDC",
+    settle: "USDC",
+    type,
+    linear: true,
+    inverse: false,
+    contract: type === "swap",
+    active: true,
+    contractSize: 1,
+    priceTick: 0.1,
+    amountStep: 0.0001,
+    minAmount: null,
+    maxAmount: null,
+    minCost: 10,
+    minLeverage: null,
+    maxLeverage: null,
+    initialMarginRate: null,
+    maintenanceMarginRate: null,
+    makerFee: null,
+    takerFee: null,
+    raw: {},
+  };
+}
 
-  test("maps signal and canonical symbols to the USDC perpetual", () => {
-    expect(toLighterPerpetualSymbol("BTC/USD", supported)).toBe("BTC/USDC:USDC");
-    expect(toLighterPerpetualSymbol("BTCUSD", supported)).toBe("BTC/USDC:USDC");
-    expect(toLighterPerpetualSymbol("BTCUSDT", supported)).toBe("BTC/USDC:USDC");
-    expect(toLighterPerpetualSymbol("eth/usdc", supported)).toBe(
-      "ETH/USDC:USDC",
-    );
-    expect(toLighterPerpetualSymbol("SOL", supported)).toBe("SOL/USDC:USDC");
+describe("Lighter execution symbol mapping", () => {
+  const index = buildLighterMarketIndex([
+    venueMarket("BTC/USDC:USDC", "BTC"),
+    venueMarket("ETH/USDC:USDC", "ETH"),
+    venueMarket("SOL/USDC:USDC", "SOL"),
+    venueMarket("EURUSD/USDC:USDC", "EURUSD"),
+    venueMarket("XAU/USDC:USDC", "XAU"),
+    venueMarket("ETH/USDC", "ETH", "spot"),
+  ]);
+
+  test("indexes every listed perpetual and ignores spot markets", () => {
+    expect(index.bySymbol.size).toBe(5);
+    expect(index.bySymbol.has("ETH/USDC")).toBe(false);
+    expect(index.byBase.get("XAU")?.symbol).toBe("XAU/USDC:USDC");
   });
 
-  test("rejects unsupported bases and non-USD quotes", () => {
-    expect(toLighterPerpetualSymbol("XRP/USD", supported)).toBeNull();
-    expect(toLighterPerpetualSymbol("BTC/ZAR", supported)).toBeNull();
-    expect(toLighterPerpetualSymbol("EUR/USD", supported)).toBeNull();
-    expect(toLighterPerpetualSymbol("", supported)).toBeNull();
+  test("resolves signal and canonical symbols to the venue market", () => {
+    expect(resolveLighterMarket("BTC/USD", index)?.symbol).toBe(
+      "BTC/USDC:USDC",
+    );
+    expect(resolveLighterMarket("BTCUSD", index)?.symbol).toBe("BTC/USDC:USDC");
+    expect(resolveLighterMarket("BTCUSDT", index)?.symbol).toBe(
+      "BTC/USDC:USDC",
+    );
+    expect(resolveLighterMarket("eth/usdc", index)?.symbol).toBe(
+      "ETH/USDC:USDC",
+    );
+    expect(resolveLighterMarket("XAUUSD", index)?.symbol).toBe(
+      "XAU/USDC:USDC",
+    );
+    // An exact match wins over stripping the quote: EUR/USD is a listed market,
+    // not a EUR position quoted in USD.
+    expect(resolveLighterMarket("EUR/USD", index)?.symbol).toBe(
+      "EURUSD/USDC:USDC",
+    );
+    expect(resolveLighterMarket("eurusd", index)?.symbol).toBe(
+      "EURUSD/USDC:USDC",
+    );
+  });
+
+  test("rejects unlisted bases and cross quotes", () => {
+    expect(resolveLighterMarket("XRP/USD", index)).toBeNull();
+    expect(resolveLighterMarket("BTC/ZAR", index)).toBeNull();
+    expect(resolveLighterMarket("ADA/BTC", index)).toBeNull();
+    expect(resolveLighterMarket("", index)).toBeNull();
+    expect(resolveLighterMarket("USD", index)).toBeNull();
+  });
+
+  test("normalises separators and case", () => {
+    expect(normalizeLighterBase("BTC/USD")).toBe("BTCUSD");
+    expect(normalizeLighterBase(" xau-usd ")).toBe("XAUUSD");
   });
 
   test("recognises managed venue positions", () => {
-    expect(isManagedVenueSymbol("BTC/USDC:USDC", supported)).toBe(true);
-    expect(isManagedVenueSymbol("XRP/USDC:USDC", supported)).toBe(false);
+    expect(isManagedVenueSymbol("BTC/USDC:USDC", index)).toBe(true);
+    expect(isManagedVenueSymbol("XRP/USDC:USDC", index)).toBe(false);
+
+    const allowed = new Set(["BTC/USDC:USDC"]);
+    expect(isManagedVenueSymbol("BTC/USDC:USDC", index, allowed)).toBe(true);
+    expect(isManagedVenueSymbol("ETH/USDC:USDC", index, allowed)).toBe(false);
   });
 });
 

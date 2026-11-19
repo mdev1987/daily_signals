@@ -40,8 +40,12 @@ export interface LighterExecutionConfig {
   /** Account-wide leverage per market, e.g. 5 for 5x. */
   leverage: number;
   marginMode: LighterMarginMode;
-  /** Base symbols that the bot may trade on Lighter, e.g. ["BTC","ETH","SOL"]. */
-  symbols: readonly string[];
+  /**
+   * Optional restriction on which venue markets may be mirrored. `null` means
+   * every perpetual the execution deployment lists; symbols are resolved from
+   * the venue's own market list rather than a hardcoded universe.
+   */
+  symbols: readonly string[] | null;
   /** Extra tolerance over the best price when signing a market order. */
   worstPriceSlippagePct: number;
   /** Testnet is the default; mainnet needs an explicit opt-in. */
@@ -211,13 +215,6 @@ function readCredentials(
   return { apiKey, publicKey, accountIndex, apiKeyIndex };
 }
 
-/**
- * Lighter testnet currently lists three perpetuals. Restricting the default
- * mirror set to them keeps every executable paper position tradable; a paper
- * signal on anything else stays paper-only.
- */
-export const DEFAULT_EXECUTION_SYMBOLS = ["BTC", "ETH", "SOL"] as const;
-
 function readDecimal(
   value: string | undefined,
   fallback: number,
@@ -246,25 +243,28 @@ function readMarginMode(value: string | undefined): LighterMarginMode {
   );
 }
 
-function readExecutionSymbols(value: string | undefined): string[] {
+/**
+ * `LIGHTER_EXECUTION_SYMBOLS` is an optional restriction, not the universe.
+ * Lighter lists crypto, FX, metals, equities and indices, so the default is to
+ * mirror every perpetual the execution deployment offers. Leaving the variable
+ * empty (or `*`/`all`) keeps that behaviour; listing symbols narrows it.
+ */
+function readExecutionSymbols(value: string | undefined): string[] | null {
   const normalized = value?.trim();
-  if (!normalized) return [...DEFAULT_EXECUTION_SYMBOLS];
+  if (!normalized) return null;
+  if (normalized === "*" || normalized.toLowerCase() === "all") return null;
 
   const symbols = normalized
     .split(",")
     .map((symbol) => symbol.trim().toUpperCase())
     .filter((symbol) => symbol.length > 0);
 
-  if (symbols.length === 0) {
-    throw new ExchangeConfigurationError(
-      "LIGHTER_EXECUTION_SYMBOLS must list at least one base symbol",
-    );
-  }
+  if (symbols.length === 0) return null;
 
   for (const symbol of symbols) {
     if (!/^[A-Z0-9]+$/.test(symbol)) {
       throw new ExchangeConfigurationError(
-        `LIGHTER_EXECUTION_SYMBOLS contains an invalid base symbol "${symbol}"`,
+        `LIGHTER_EXECUTION_SYMBOLS contains an invalid symbol "${symbol}"`,
       );
     }
   }
@@ -464,9 +464,12 @@ export function assertLighterExecutionAllowed(config: LighterConfig): void {
     );
   }
 
-  if (config.execution.symbols.length === 0) {
+  if (
+    config.execution.symbols !== null &&
+    config.execution.symbols.length === 0
+  ) {
     throw new ExchangeConfigurationError(
-      "Lighter execution needs at least one symbol in LIGHTER_EXECUTION_SYMBOLS",
+      "LIGHTER_EXECUTION_SYMBOLS must be empty (all venue markets) or list symbols",
     );
   }
 }
