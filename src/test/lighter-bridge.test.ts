@@ -47,6 +47,12 @@ interface FakeOptions {
   createOrderError?: boolean;
   /** Hook used to inspect state at the moment the order is submitted. */
   beforeOrder?: () => Promise<void>;
+  /** Terminal status reported for entry orders (default "closed"). */
+  entryStatus?: string;
+  /** Make cancelOrder throw. */
+  cancelError?: boolean;
+  /** Fill the working order instead of cancelling it, simulating a race. */
+  fillOnCancel?: boolean;
 }
 
 function fakeAdapter(opts: FakeOptions = {}) {
@@ -55,6 +61,7 @@ function fakeAdapter(opts: FakeOptions = {}) {
 
   const adapter: any = {
     orders,
+    cancelled: [] as string[],
     options: opts,
     positions: [...(opts.positions ?? [])],
     closed: false,
@@ -90,6 +97,32 @@ function fakeAdapter(opts: FakeOptions = {}) {
     }),
     getTicker: async () => ({ last: 100_005 }),
     getOpenOrders: async () => opts.openOrders ?? [],
+    cancelOrder: async (orderId: string) => {
+      if (opts.cancelError) throw new Error("cancel rejected");
+
+      const order = (opts.openOrders ?? []).find(
+        (candidate: any) => candidate.id === orderId,
+      );
+      if (opts.fillOnCancel && order) {
+        adapter.positions = [
+          ...adapter.positions,
+          {
+            symbol: order.symbol,
+            side: order.side === "buy" ? "long" : "short",
+            contracts: order.amount,
+            entryPrice: 100_000,
+            leverage: opts.reportedLeverage ?? null,
+            unrealizedPnl: 0,
+          },
+        ];
+      } else {
+        adapter.cancelled.push(orderId);
+      }
+
+      opts.openOrders = (opts.openOrders ?? []).filter(
+        (candidate: any) => candidate.id !== orderId,
+      );
+    },
     getPositions: async () => {
       if (opts.positionsErrorAfterSubmit && orders.length > 0) {
         throw new Error("position endpoint unavailable");
@@ -178,7 +211,7 @@ function fakeAdapter(opts: FakeOptions = {}) {
         amount: req.amount,
         filled,
         remaining: req.amount - filled,
-        status: "closed",
+        status: opts.entryStatus ?? "closed",
         timestamp: null,
         raw: null,
       };
@@ -899,5 +932,175 @@ describe("Lighter bridge failure attribution", () => {
     expect(text).toContain("attempt 1/3 failed");
     expect(text).toContain("could not flatten BTC/USDC:USDC");
     expect(text).toContain("shutdown left bot-owned positions open");
+  });
+});
+
+describe("Lighter bridge pending entry orders", () => {
+  test("an acknowledged entry with a working order stays PENDING", async () => {
+    const a = fakeAdapter({ entryStatus: "open", fillRatio: 0 });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(a.orders).toHaveLength(1);
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "PENDING",
+      confirmation: "ACKNOWLEDGED",
+      filled_amount: 0,
+    });
+
+    const rows = await connection.runAndReadAll(
+      "SELECT status FROM lighter_executions WHERE action = 'OPEN'",
+    );
+    expect(rows.getRowObjects()[0]?.status).toBe("SUBMITTED");
+    expect(logs.join("\n")).toContain("still working");
+  });
+
+  test("shutdown cancels a working entry order and verifies it is gone", async () => {
+    const a = fakeAdapter({ createOrderError: true, fillRatio: 0 });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    expect((await ownershipOf(connection))?.status).toBe("PENDING");
+
+    a.options.openOrders = [
+      { id: "ord-1", symbol: SYMBOL, side: "buy", amount: 0.001 },
+    ];
+    await bridge.close();
+
+    expect(a.cancelled).toEqual(["ord-1"]);
+    expect(a.options.openOrders).toHaveLength(0);
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+
+    const text = logs.join("\n");
+    expect(text).toContain("cancelled before it filled");
+    expect(text).toContain("shutdown flatten complete");
+  });
+
+  test("shutdown adopts and flattens a fill that landed before the cancel", async () => {
+    const a = fakeAdapter({ createOrderError: true, fillRatio: 0 });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.options.openOrders = [
+      { id: "ord-1", symbol: SYMBOL, side: "buy", amount: 0.001 },
+    ];
+    a.options.fillOnCancel = true;
+    await bridge.close();
+
+    expect(a.positions).toHaveLength(0);
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+    expect(logs.join("\n")).toContain("filled before the cancel");
+    expect(logs.join("\n")).toContain("shutdown flatten complete");
+  });
+
+  test("shutdown reports a working entry order it cannot cancel", async () => {
+    const a = fakeAdapter({ createOrderError: true, fillRatio: 0 });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.options.openOrders = [
+      { id: "ord-1", symbol: SYMBOL, side: "buy", amount: 0.001 },
+    ];
+    a.options.cancelError = true;
+    await bridge.close();
+
+    expect((await ownershipOf(connection))?.status).toBe("PENDING");
+    const text = logs.join("\n");
+    expect(text).toContain("could not resolve pending intent");
+    expect(text).toContain("pending entry");
+    expect(text).toContain("shutdown left bot-owned positions open");
+  });
+});
+
+describe("Lighter bridge close attribution", () => {
+  test("shutdown attributes an externally closed position to external", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.positions = [];
+    await bridge.close();
+
+    const row = await ownershipOf(connection);
+    expect(row?.status).toBe("CLOSED");
+    expect(row?.bot_closed_amount).toBe(0);
+    expect(row?.external_closed_amount).toBeCloseTo(0.001, 9);
+  });
+
+  test("closeOwned reports an already-flat venue without sending an order", async () => {
+    const a = fakeAdapter();
+    const { bridge } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    const ordersBefore = a.orders.length;
+
+    a.positions = [];
+    const outcome = await (bridge as any).closeOwned({
+      paperPositionId: "p1",
+      symbol: SYMBOL,
+      ownedSide: "long",
+      amount: 0.001,
+      reason: "test",
+      action: "CLOSE",
+    });
+
+    expect(outcome.alreadyFlat).toBe(true);
+    expect(outcome.filled).toBe(0);
+    expect(a.orders).toHaveLength(ordersBefore);
+  });
+
+  test("legacy closed size is backfilled into an explicit column", async () => {
+    const instance = await DuckDBInstance.create(":memory:");
+    const connection = await instance.connect();
+    await connection.run(`
+      CREATE TABLE lighter_owned_positions (
+        paper_position_id VARCHAR PRIMARY KEY,
+        symbol VARCHAR NOT NULL,
+        side VARCHAR NOT NULL,
+        requested_amount DOUBLE NOT NULL,
+        filled_amount DOUBLE NOT NULL,
+        closed_amount DOUBLE NOT NULL,
+        average_price DOUBLE,
+        order_id VARCHAR,
+        status VARCHAR NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+      )
+    `);
+    await connection.run(
+      `INSERT INTO lighter_owned_positions VALUES
+         ('legacy', ?, 'long', 0.003, 0.003, 0.002, 100000, NULL, 'CLOSED', 1, 1)`,
+      [SYMBOL],
+    );
+
+    const bridge = new LighterExecutionBridge({
+      connection: connection as any,
+      config: loadLighterConfig(ENV),
+      adapter: fakeAdapter() as unknown as LighterAdapter,
+      stopLossPct: 2,
+      log: () => {},
+      sleep: async () => {},
+    });
+    await (bridge as any).ensureAuditTable();
+
+    const rows = await connection.runAndReadAll(
+      `SELECT legacy_closed_amount, bot_closed_amount, external_closed_amount
+       FROM lighter_owned_positions`,
+    );
+    expect(rows.getRowObjects()[0]).toMatchObject({
+      legacy_closed_amount: 0.002,
+      bot_closed_amount: 0,
+      external_closed_amount: 0,
+    });
   });
 });

@@ -91,6 +91,11 @@ export interface OwnedVenuePosition {
   botClosedAmount: number;
   /** Quantity found flat on the venue without a bot close order. */
   externalClosedAmount: number;
+  /**
+   * Historical closed size recorded before attribution existed. Kept so
+   * closedAmount is never silently larger than the two attributed buckets.
+   */
+  legacyClosedAmount: number;
   averagePrice: number | null;
   orderId: string | null;
   status: OwnershipStatus;
@@ -118,6 +123,12 @@ interface CloseOutcome {
   price: number | null;
   side: "buy" | "sell";
   reference: string | null;
+  /**
+   * True when no bot order was sent because the venue position was already
+   * flat. The size disappeared through a manual or external action and must not
+   * be counted as a bot fill.
+   */
+  alreadyFlat: boolean;
 }
 
 export interface LighterExecutionBridgeOptions {
@@ -494,6 +505,7 @@ export class LighterExecutionBridge {
         closedAmount: 0,
         botClosedAmount: 0,
         externalClosedAmount: 0,
+        legacyClosedAmount: 0,
         averagePrice: price,
         orderId: null,
         status: "PENDING",
@@ -575,6 +587,49 @@ export class LighterExecutionBridge {
       );
       const averagePrice = verification.entryPrice ?? order.price ?? price;
 
+      // A zero observed fill is only final when the order is terminal. An open
+      // order, or a bare acknowledgement (Lighter reports "unknown" for an IOC
+      // ack), can still produce a position, so keep the intent PENDING and let
+      // reconcile adopt it instead of downgrading it to UNVERIFIED.
+      const terminalOrder =
+        order.status === "closed" ||
+        order.status === "canceled" ||
+        order.status === "expired" ||
+        order.status === "rejected";
+      const stillWorking =
+        filled <= OWNERSHIP_EPSILON &&
+        !terminalOrder &&
+        (order.status === "open" ||
+          order.status === "unknown" ||
+          (order.remaining !== null && order.remaining > OWNERSHIP_EPSILON));
+
+      if (stillWorking) {
+        await this.record({
+          paperPositionId: position.id,
+          action: "OPEN",
+          symbol,
+          side,
+          amount,
+          price,
+          orderId: reference,
+          status: "SUBMITTED",
+          requestedAmount: amount,
+          filledAmount: 0,
+          remainingAmount:
+            order.remaining !== null && order.remaining > 0
+              ? order.remaining
+              : amount,
+          averagePrice: order.average ?? null,
+          txHash: reference,
+        });
+
+        this.log(
+          `[EXEC] WARN ${symbol} entry ${reference ?? "?"} is still working with ` +
+            `no observed fill; ownership stays PENDING for reconcile`,
+        );
+        return;
+      }
+
       await this.record({
         paperPositionId: position.id,
         action: "OPEN",
@@ -600,6 +655,7 @@ export class LighterExecutionBridge {
         closedAmount: 0,
         botClosedAmount: 0,
         externalClosedAmount: 0,
+        legacyClosedAmount: 0,
         averagePrice,
         orderId: reference,
         status: filled > OWNERSHIP_EPSILON ? "OPEN" : "UNVERIFIED",
@@ -675,7 +731,11 @@ export class LighterExecutionBridge {
 
               remaining = outcome.remaining;
               if (remaining <= OWNERSHIP_EPSILON) {
-                await this.markOwnershipClosed(position.id, "CLOSE", "BOT");
+                await this.markOwnershipClosed(
+                  position.id,
+                  "CLOSE",
+                  outcome.alreadyFlat ? "EXTERNAL" : "BOT",
+                );
                 this.log(
                   `[EXEC] ${symbol} leverage mismatch unwound on attempt ${attempt}`,
                 );
@@ -827,7 +887,11 @@ export class LighterExecutionBridge {
         await this.addOwnershipClosed(position.id, outcome.filled, "BOT");
       }
       if (outcome.remaining <= OWNERSHIP_EPSILON) {
-        await this.markOwnershipClosed(position.id, "CLOSE", "BOT");
+        await this.markOwnershipClosed(
+          position.id,
+          "CLOSE",
+          outcome.alreadyFlat ? "EXTERNAL" : "BOT",
+        );
       }
     } catch (error) {
       await this.recordFailure(position.id, "CLOSE", symbol, side, amount, price, error);
@@ -891,6 +955,45 @@ export class LighterExecutionBridge {
     await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
     await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
     return { row: null, outcome: "UNFILLED" };
+  }
+
+  /**
+   * Cancels the working entry order for a PENDING intent. Only an order whose
+   * id matches the recorded reference, or the single working order on the
+   * intent's side, is cancelled. Returns false when the order cannot be
+   * identified or is still working after the cancel, so shutdown never assumes
+   * that an outstanding entry is gone.
+   */
+  private async cancelPendingEntry(entry: OwnedVenuePosition): Promise<boolean> {
+    const working = await this.adapter.getOpenOrders(entry.symbol);
+    if (working.length === 0) return true;
+
+    const intentSide = entry.side === "long" ? "buy" : "sell";
+    const candidates = working.filter((order) => order.side === intentSide);
+    const byId = entry.orderId
+      ? candidates.find((order) => order.id === entry.orderId)
+      : undefined;
+    // Lighter's acknowledgement is often a transaction hash rather than an
+    // order id. With exclusive account use, a single working order on the
+    // intent's side can only be the bot's entry.
+    const target = byId ?? (candidates.length === 1 ? candidates[0] : undefined);
+
+    if (!target || !target.id) {
+      this.log(
+        `[EXEC] cannot identify the working entry order on ${entry.symbol} ` +
+          `for paper ${entry.paperPositionId}; refusing to cancel`,
+      );
+      return false;
+    }
+
+    await this.adapter.cancelOrder(target.id, entry.symbol);
+    this.log(
+      `[EXEC] canceled working entry order ${target.id} on ${entry.symbol} ` +
+        `for paper ${entry.paperPositionId}`,
+    );
+
+    const remaining = await this.adapter.getOpenOrders(entry.symbol);
+    return !remaining.some((order) => order.id === target.id);
   }
 
   private async mirrorReconcile(
@@ -1038,7 +1141,7 @@ export class LighterExecutionBridge {
           await this.markOwnershipClosed(
             match.paperPositionId,
             "RECONCILE_CLOSE",
-            "BOT",
+            outcome.alreadyFlat ? "EXTERNAL" : "BOT",
           );
         }
       }
@@ -1200,13 +1303,21 @@ export class LighterExecutionBridge {
       .reduce((total, position) => total + Math.abs(position.contracts), 0);
 
     if (!(input.amount > OWNERSHIP_EPSILON) || before <= OWNERSHIP_EPSILON) {
+      const alreadyFlat = before <= OWNERSHIP_EPSILON;
+      if (alreadyFlat) {
+        this.log(
+          `[EXEC] ${input.action} ${input.symbol} is already flat on the venue; ` +
+            `no close order sent (${input.reason})`,
+        );
+      }
       return {
         filled: 0,
         remaining: before,
-        status: before <= OWNERSHIP_EPSILON ? "FILLED" : "UNKNOWN",
+        status: "UNKNOWN",
         price: null,
         side: closeSide,
         reference: null,
+        alreadyFlat,
       };
     }
 
@@ -1223,6 +1334,7 @@ export class LighterExecutionBridge {
         price: null,
         side: closeSide,
         reference: null,
+        alreadyFlat: false,
       };
     }
 
@@ -1278,6 +1390,7 @@ export class LighterExecutionBridge {
       price,
       side: closeSide,
       reference,
+      alreadyFlat: false,
     };
   }
 
@@ -1334,6 +1447,7 @@ export class LighterExecutionBridge {
       closedAmount: Number(row.closed_amount ?? 0),
       botClosedAmount: Number(row.bot_closed_amount ?? 0),
       externalClosedAmount: Number(row.external_closed_amount ?? 0),
+      legacyClosedAmount: Number(row.legacy_closed_amount ?? 0),
       averagePrice:
         row.average_price === null || row.average_price === undefined
           ? null
@@ -1368,6 +1482,7 @@ export class LighterExecutionBridge {
     closedAmount: number;
     botClosedAmount: number;
     externalClosedAmount: number;
+    legacyClosedAmount: number;
     averagePrice: number | null;
     orderId: string | null;
     status: OwnershipStatus;
@@ -1379,14 +1494,16 @@ export class LighterExecutionBridge {
         `INSERT INTO lighter_owned_positions
          (paper_position_id, symbol, side, requested_amount, filled_amount,
           closed_amount, bot_closed_amount, external_closed_amount,
-          average_price, order_id, status, confirmation, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (paper_position_id) DO UPDATE SET
            requested_amount = excluded.requested_amount,
            filled_amount = excluded.filled_amount,
            closed_amount = excluded.closed_amount,
            bot_closed_amount = excluded.bot_closed_amount,
            external_closed_amount = excluded.external_closed_amount,
+           legacy_closed_amount = excluded.legacy_closed_amount,
            average_price = excluded.average_price,
            order_id = excluded.order_id,
            status = excluded.status,
@@ -1401,6 +1518,7 @@ export class LighterExecutionBridge {
           entry.closedAmount,
           entry.botClosedAmount,
           entry.externalClosedAmount,
+          entry.legacyClosedAmount,
           entry.averagePrice,
           entry.orderId,
           entry.status,
@@ -1523,7 +1641,6 @@ export class LighterExecutionBridge {
     await this.markOwnershipStatus(paperPositionId, "CLOSED");
   }
 
-  /** Closes every position the registry proves the bot owns. */
   /**
    * Closes every position the registry proves the bot owns.
    *
@@ -1566,6 +1683,47 @@ export class LighterExecutionBridge {
             `[EXEC] ${action} resolved pending entry ${entry.paperPositionId} ` +
               `on ${entry.symbol}: ${result.row.filledAmount} ${entry.side}`,
           );
+          continue;
+        }
+
+        if (result.outcome !== "WORKING") continue;
+
+        // An outstanding entry order can fill after the process exits, so it
+        // must be cancelled and verified, not ignored.
+        const cleared = await this.cancelPendingEntry(entry);
+        if (!cleared) {
+          residual.push(entry);
+          this.log(
+            `[EXEC] ERROR ${action} pending entry ${entry.paperPositionId} on ` +
+              `${entry.symbol} still has a working order; it could fill after shutdown`,
+          );
+          continue;
+        }
+
+        const after = await this.resolvePendingOwnership(
+          entry,
+          await this.positionsFor(entry.symbol),
+          alreadyClaimed,
+        );
+        if (after.outcome === "ADOPTED" && after.row) {
+          claimedSides.add(`${entry.symbol}:${entry.side}`);
+          owned.push(after.row);
+          this.log(
+            `[EXEC] ${action} pending entry ${entry.paperPositionId} on ` +
+              `${entry.symbol} filled before the cancel: ` +
+              `${after.row.filledAmount} ${entry.side}`,
+          );
+        } else if (after.outcome === "WORKING") {
+          residual.push(entry);
+          this.log(
+            `[EXEC] ERROR ${action} pending entry ${entry.paperPositionId} on ` +
+              `${entry.symbol} still has a working order after the cancel`,
+          );
+        } else {
+          this.log(
+            `[EXEC] ${action} pending entry ${entry.paperPositionId} on ` +
+              `${entry.symbol} was cancelled before it filled`,
+          );
         }
       } catch (error) {
         residual.push(entry);
@@ -1598,7 +1756,13 @@ export class LighterExecutionBridge {
           );
 
           if (!held || !(remaining > OWNERSHIP_EPSILON)) {
-            await this.markOwnershipClosed(entry.paperPositionId, action, "BOT");
+            // No close order was sent by this pass: the size is gone through a
+            // manual or external action, not a bot fill.
+            await this.markOwnershipClosed(
+              entry.paperPositionId,
+              action,
+              "EXTERNAL",
+            );
             resolved = true;
             break;
           }
@@ -1622,7 +1786,11 @@ export class LighterExecutionBridge {
           }
 
           if (outcome.remaining <= OWNERSHIP_EPSILON) {
-            await this.markOwnershipClosed(entry.paperPositionId, action, "BOT");
+            await this.markOwnershipClosed(
+              entry.paperPositionId,
+              action,
+              outcome.alreadyFlat ? "EXTERNAL" : "BOT",
+            );
             resolved = true;
             break;
           }
@@ -1732,11 +1900,23 @@ export class LighterExecutionBridge {
         "confirmation VARCHAR DEFAULT 'CONFIRMED'",
         "bot_closed_amount DOUBLE DEFAULT 0",
         "external_closed_amount DOUBLE DEFAULT 0",
+        "legacy_closed_amount DOUBLE DEFAULT 0",
       ]) {
         await this.connection.run(
           `ALTER TABLE lighter_owned_positions ADD COLUMN IF NOT EXISTS ${column}`,
         );
       }
+
+      // Rows written before attribution existed keep their closed size in
+      // legacy_closed_amount, so the buckets never contradict closed_amount.
+      await this.connection.run(`
+        UPDATE lighter_owned_positions
+        SET legacy_closed_amount =
+          closed_amount - bot_closed_amount - external_closed_amount
+        WHERE legacy_closed_amount = 0
+          AND closed_amount >
+            bot_closed_amount + external_closed_amount + 0.000000001
+      `);
     });
   }
 

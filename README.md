@@ -591,6 +591,10 @@ is the registry, keyed by `paper_position_id`:
   (sized from the venue, priced from its entry price) instead of discarding the
   trail. A `PENDING` intent with no position and no working order is closed as
   never filled.
+- A zero observed fill is only treated as final when the order is terminal. An
+  `open` order, or a bare acknowledgement that may still fill, keeps the row
+  `PENDING`; it is never downgraded to `UNVERIFIED` while it can still produce a
+  position.
 - Opens are refused when the market already has a position or a resting order,
   so a size that appears after an intent is attributable to the bot's order.
 - A fill of zero (thin testnet book) is stored as `UNVERIFIED`. The bridge will
@@ -601,9 +605,11 @@ is the registry, keyed by `paper_position_id`:
   match the owned side, the close is refused.
 - Closed size is attributed: `bot_closed_amount` is what this bot's reduce-only
   orders measured as filled, `external_closed_amount` is size found flat on the
-  venue without a bot order (manual close, another process). `closed_amount` is
-  their sum, so execution statistics do not mistake a manual close for a bot
-  fill.
+  venue without a bot order (manual close, another process). A close attempt
+  that finds the venue already flat sends nothing and is attributed externally.
+  `closed_amount` is their sum, so execution statistics do not mistake a manual
+  close for a bot fill. Rows written before attribution existed are backfilled
+  into `legacy_closed_amount` instead of being silently reported as zero.
 - Each execution row records requested, filled, remaining and average price plus
   the order id / transaction hash (`lighter_executions`). A close is classified
   from the measured fill first, so a canceled or expired order with a partial
@@ -616,8 +622,11 @@ is the registry, keyed by `paper_position_id`:
   disconnects. A thrown order, price or position error counts as a failed
   attempt and does not stop the remaining attempts or the other owned
   positions. Pending entry intents are resolved from the venue first, so an
-  unconfirmed fill is still flattened, and an intent that cannot be resolved is
-  reported as a pending entry rather than assumed flat. Any residual position is
+  unconfirmed fill is still flattened. A working entry order is cancelled (by
+  order id, or the single order on the intent's side) and verified gone before
+  shutdown completes; a position that filled before the cancel is adopted and
+  flattened, and an order that cannot be cancelled or verified is reported as an
+  unresolved pending entry rather than assumed flat. Any residual position is
   logged as an error with its symbol and size; a shutdown that could not
   flatten does not claim success. `SIGKILL`, machine failure and network loss
   cannot run this policy, which is why exchange-side stops are still required.
