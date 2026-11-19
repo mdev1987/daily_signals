@@ -53,6 +53,10 @@ interface FakeOptions {
   cancelError?: boolean;
   /** Fill the working order instead of cancelling it, simulating a race. */
   fillOnCancel?: boolean;
+  /** Reported remaining quantity on the entry order (venue remainder). */
+  entryRemaining?: number;
+  /** Report the close order as still open with an unfilled remainder. */
+  closeOpenRemainder?: boolean;
 }
 
 function fakeAdapter(opts: FakeOptions = {}) {
@@ -177,7 +181,12 @@ function fakeAdapter(opts: FakeOptions = {}) {
           filled,
           remaining: req.amount - filled,
           status:
-            opts.closeStatus ?? (opts.closeReject ? "rejected" : "closed"),
+            opts.closeStatus ??
+            (opts.closeOpenRemainder
+              ? "open"
+              : opts.closeReject
+                ? "rejected"
+                : "closed"),
           timestamp: null,
           raw: null,
         };
@@ -210,7 +219,7 @@ function fakeAdapter(opts: FakeOptions = {}) {
         price: req.price ?? null,
         amount: req.amount,
         filled,
-        remaining: req.amount - filled,
+        remaining: opts.entryRemaining ?? req.amount - filled,
         status: opts.entryStatus ?? "closed",
         timestamp: null,
         raw: null,
@@ -1013,7 +1022,7 @@ describe("Lighter bridge pending entry orders", () => {
 
     expect((await ownershipOf(connection))?.status).toBe("PENDING");
     const text = logs.join("\n");
-    expect(text).toContain("could not resolve pending intent");
+    expect(text).toContain("still has a working order");
     expect(text).toContain("pending entry");
     expect(text).toContain("shutdown left bot-owned positions open");
   });
@@ -1102,5 +1111,185 @@ describe("Lighter bridge close attribution", () => {
       bot_closed_amount: 0,
       external_closed_amount: 0,
     });
+  });
+});
+
+describe("Lighter bridge order lifetime", () => {
+  test("entries and closes ask for an explicit IOC market order", async () => {
+    const a = fakeAdapter();
+    const { bridge } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    bridge.onClose(paper(), "STOP_LOSS");
+    await bridge.flush();
+
+    expect(a.orders).toHaveLength(2);
+    expect(a.orders[0]).toMatchObject({ type: "market", timeInForce: "IOC" });
+    expect(a.orders[1]).toMatchObject({ type: "market", timeInForce: "IOC" });
+  });
+
+  test("a partial entry cancels its working remainder before claiming the fill", async () => {
+    const a = fakeAdapter({
+      fillRatio: 0.5,
+      entryStatus: "open",
+      entryRemaining: 0.0005,
+    });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(a.cancelled).toEqual(["o1"]);
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "OPEN",
+      confirmation: "CONFIRMED",
+      filled_amount: 0.0005,
+    });
+    expect(logs.join("\n")).toContain("canceled working order o1");
+  });
+
+  test("a partial entry whose remainder cannot be cancelled stays UNRESOLVED", async () => {
+    const a = fakeAdapter({
+      fillRatio: 0.5,
+      entryStatus: "open",
+      entryRemaining: 0.0005,
+      cancelError: true,
+    });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "OPEN",
+      confirmation: "UNRESOLVED",
+      filled_amount: 0.0005,
+    });
+    expect(logs.join("\n")).toContain("could not cancel working order o1");
+  });
+
+  test("a partial close cancels its remainder and records the measured fill", async () => {
+    const a = fakeAdapter({ closeFillRatio: 0.5, closeOpenRemainder: true });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    bridge.onClose(paper(), "STOP_LOSS");
+    await bridge.flush();
+
+    const rows = await connection.runAndReadAll(
+      "SELECT status FROM lighter_executions WHERE action = 'CLOSE'",
+    );
+    expect(rows.getRowObjects()[0]?.status).toBe("PARTIALLY_FILLED");
+
+    const row = await ownershipOf(connection);
+    expect(row?.status).toBe("OPEN");
+    expect(row?.bot_closed_amount).toBeCloseTo(0.0005, 9);
+    expect(a.cancelled).toContain("o2");
+    expect(logs.join("\n")).toContain("canceled working order o2");
+  });
+
+  test("shutdown does not stack a second close while one is working", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.options.openOrders = [
+      { id: "close-1", symbol: SYMBOL, side: "sell", amount: 0.001 },
+    ];
+    await bridge.close();
+
+    expect(a.orders).toHaveLength(1);
+    expect(a.orders.some((order: any) => order.reduceOnly)).toBe(false);
+    expect((await ownershipOf(connection))?.status).toBe("OPEN");
+
+    const text = logs.join("\n");
+    expect(text).toContain("not stacking another close");
+    expect(text).toContain("could not flatten BTC/USDC:USDC");
+    expect(text).toContain("shutdown left bot-owned positions open");
+  });
+
+  test("adoption cancels a working entry order before claiming the position", async () => {
+    const a = fakeAdapter({ createOrderError: true });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.options.openOrders = [
+      { id: "o1", symbol: SYMBOL, side: "buy", amount: 0.0005 },
+    ];
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect(a.cancelled).toContain("o1");
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "OPEN",
+      confirmation: "CONFIRMED",
+    });
+    expect(logs.join("\n")).toContain("adopted");
+  });
+
+  test("adoption keeps the intent PENDING when its entry order survives", async () => {
+    const a = fakeAdapter({ createOrderError: true, cancelError: true });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    a.options.openOrders = [
+      { id: "o1", symbol: SYMBOL, side: "buy", amount: 0.0005 },
+    ];
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect((await ownershipOf(connection))?.status).toBe("PENDING");
+    expect(logs.join("\n")).toContain("still has a working order");
+  });
+
+  test("reconcile will not close a record while its entry order can still fill", async () => {
+    const a = fakeAdapter({
+      fillRatio: 0.5,
+      entryStatus: "open",
+      entryRemaining: 0.0005,
+      cancelError: true,
+    });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    expect((await ownershipOf(connection))?.confirmation).toBe("UNRESOLVED");
+
+    a.positions = [];
+    a.options.openOrders = [
+      { id: "o1", symbol: SYMBOL, side: "buy", amount: 0.0005 },
+    ];
+    bridge.reconcile([]);
+    await bridge.flush();
+
+    expect((await ownershipOf(connection))?.status).toBe("OPEN");
+    expect(logs.join("\n")).toContain("not marking it closed");
+  });
+
+  test("shutdown keeps reporting exposure when the registry read fails", async () => {
+    const a = fakeAdapter({ closeError: true });
+    const { bridge, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    (bridge as any).loadOwnership = async () => {
+      throw new Error("registry unavailable");
+    };
+
+    await bridge.close();
+
+    const text = logs.join("\n");
+    expect(text).toContain("could not flatten BTC/USDC:USDC");
+    expect(text).toContain("shutdown left bot-owned positions open");
+    expect(text).not.toContain("shutdown flatten complete");
   });
 });

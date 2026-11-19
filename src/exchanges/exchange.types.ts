@@ -152,6 +152,12 @@ export interface Order {
   raw: unknown;
 }
 
+/**
+ * Order lifetime. Venues differ in their default: Lighter defaults to GTT, so
+ * a "market" order without an explicit IOC can rest on the book and fill later.
+ */
+export type OrderTimeInForce = "GTC" | "IOC" | "FOK" | "GTT";
+
 export interface OrderRequest {
   symbol: string;
   type: OrderType;
@@ -164,6 +170,12 @@ export interface OrderRequest {
   price?: number;
   clientOrderId?: string;
   reduceOnly?: boolean;
+  /**
+   * Explicit lifetime. Execution paths that intend an immediate fill must send
+   * `IOC`; an unfilled remainder is then canceled by the venue instead of
+   * resting as an untracked working order.
+   */
+  timeInForce?: OrderTimeInForce;
 }
 
 export interface ExchangeAdapter {

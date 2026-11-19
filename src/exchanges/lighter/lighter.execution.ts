@@ -129,6 +129,13 @@ interface CloseOutcome {
    * be counted as a bot fill.
    */
   alreadyFlat: boolean;
+  /**
+   * True when a working reduce-only order on the same side blocks another
+   * close, or when this close's own remainder could not be cancelled and
+   * verified. Callers must not submit another reduce-only order while this is
+   * set, or two closes could work the same position at once.
+   */
+  remainderUnresolved: boolean;
 }
 
 export interface LighterExecutionBridgeOptions {
@@ -521,6 +528,9 @@ export class LighterExecutionBridge {
           side,
           amount,
           price,
+          // Explicit IOC: a market entry must fill now or be cancelled, never
+          // rest on the book after the bridge stops watching it.
+          timeInForce: "IOC",
         });
       } catch (error) {
         // The signed order may have reached the venue even though the call
@@ -630,6 +640,25 @@ export class LighterExecutionBridge {
         return;
       }
 
+      // A partial entry can leave a working remainder. IOC should prevent it,
+      // but an unfilled remainder must never keep working after the position is
+      // treated as fully owned, or a later fill would add untracked exposure.
+      let remainderUnresolved = false;
+      const orderRemaining = order.remaining ?? Math.max(0, amount - filled);
+      if (
+        filled > OWNERSHIP_EPSILON &&
+        !terminalOrder &&
+        (order.status === "open" || orderRemaining > OWNERSHIP_EPSILON)
+      ) {
+        remainderUnresolved = !(await this.cancelWorkingOrder(symbol, order.id));
+        if (remainderUnresolved) {
+          this.log(
+            `[EXEC] ERROR ${symbol} entry ${reference ?? "?"} left a working ` +
+              `remainder that could not be cancelled; ownership stays UNRESOLVED`,
+          );
+        }
+      }
+
       await this.record({
         paperPositionId: position.id,
         action: "OPEN",
@@ -659,7 +688,7 @@ export class LighterExecutionBridge {
         averagePrice,
         orderId: reference,
         status: filled > OWNERSHIP_EPSILON ? "OPEN" : "UNVERIFIED",
-        confirmation: "CONFIRMED",
+        confirmation: remainderUnresolved ? "UNRESOLVED" : "CONFIRMED",
         now: this.now(),
       });
 
@@ -730,6 +759,12 @@ export class LighterExecutionBridge {
               }
 
               remaining = outcome.remaining;
+              if (outcome.remainderUnresolved) {
+                unresolvedReason =
+                  `${remaining} still open; a working close order blocks ` +
+                  `another attempt`;
+                break;
+              }
               if (remaining <= OWNERSHIP_EPSILON) {
                 await this.markOwnershipClosed(
                   position.id,
@@ -931,6 +966,13 @@ export class LighterExecutionBridge {
         return { row: null, outcome: "DUPLICATE" };
       }
 
+      // A working entry order can still add size to this side. Cancel and
+      // verify it before claiming the position; otherwise a post-shutdown fill
+      // would land on a record this bot already considers flat.
+      if (!(await this.cancelPendingEntry(entry))) {
+        return { row: null, outcome: "WORKING" };
+      }
+
       const size = Math.abs(held.contracts);
       const entryPrice = Number.isFinite(held.entryPrice)
         ? held.entryPrice
@@ -958,14 +1000,70 @@ export class LighterExecutionBridge {
   }
 
   /**
-   * Cancels the working entry order for a PENDING intent. Only an order whose
-   * id matches the recorded reference, or the single working order on the
-   * intent's side, is cancelled. Returns false when the order cannot be
-   * identified or is still working after the cancel, so shutdown never assumes
-   * that an outstanding entry is gone.
+   * Cancels one specific working order and verifies it is no longer on the
+   * book. Returns false when the id is unknown, the cancel throws, or the order
+   * is still working afterwards. Callers must not treat a fill as final until
+   * this returns true or the order is terminal.
+   */
+  private async cancelWorkingOrder(
+    symbol: string,
+    orderId: string | null,
+  ): Promise<boolean> {
+    if (!orderId) {
+      this.log(
+        `[EXEC] cannot cancel a working order on ${symbol}: no order id was returned`,
+      );
+      return false;
+    }
+
+    try {
+      await this.adapter.cancelOrder(orderId, symbol);
+    } catch (error) {
+      this.log(
+        `[EXEC] ERROR ${symbol} could not cancel working order ${orderId}: ` +
+          `${this.adapter.redact(error)}`,
+      );
+      return false;
+    }
+
+    try {
+      const remaining = await this.adapter.getOpenOrders(symbol);
+      const cleared = !remaining.some((order) => order.id === orderId);
+      if (cleared) {
+        this.log(`[EXEC] canceled working order ${orderId} on ${symbol}`);
+      } else {
+        this.log(
+          `[EXEC] ERROR ${symbol} order ${orderId} is still working after the cancel`,
+        );
+      }
+      return cleared;
+    } catch (error) {
+      this.log(
+        `[EXEC] ERROR ${symbol} could not verify the cancel of ${orderId}: ` +
+          `${this.adapter.redact(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Cancels the working entry order for an intent or an unconfirmed entry. Only
+   * an order whose id matches the recorded reference, or the single working
+   * order on the intent's side, is cancelled. Returns false when the order
+   * cannot be identified or is still working after the cancel, so shutdown
+   * never assumes that an outstanding entry is gone.
    */
   private async cancelPendingEntry(entry: OwnedVenuePosition): Promise<boolean> {
-    const working = await this.adapter.getOpenOrders(entry.symbol);
+    let working: Order[];
+    try {
+      working = await this.adapter.getOpenOrders(entry.symbol);
+    } catch (error) {
+      this.log(
+        `[EXEC] ERROR could not read open orders on ${entry.symbol} for paper ` +
+          `${entry.paperPositionId}: ${this.adapter.redact(error)}`,
+      );
+      return false;
+    }
     if (working.length === 0) return true;
 
     const intentSide = entry.side === "long" ? "buy" : "sell";
@@ -986,14 +1084,7 @@ export class LighterExecutionBridge {
       return false;
     }
 
-    await this.adapter.cancelOrder(target.id, entry.symbol);
-    this.log(
-      `[EXEC] canceled working entry order ${target.id} on ${entry.symbol} ` +
-        `for paper ${entry.paperPositionId}`,
-    );
-
-    const remaining = await this.adapter.getOpenOrders(entry.symbol);
-    return !remaining.some((order) => order.id === target.id);
+    return this.cancelWorkingOrder(entry.symbol, target.id);
   }
 
   private async mirrorReconcile(
@@ -1062,6 +1153,40 @@ export class LighterExecutionBridge {
         }
       }
 
+      // An entry whose remainder was never confirmed must not be treated as a
+      // settled position. Cancel the working remainder before the row is used.
+      const entryOrderBlocked = new Set<string>();
+      for (const entry of openOwned.filter(
+        (row) => row.symbol === symbol && row.confirmation !== "CONFIRMED",
+      )) {
+        try {
+          if (await this.cancelPendingEntry(entry)) {
+            await this.setEntryConfirmation(
+              entry.paperPositionId,
+              "CONFIRMED",
+            );
+            entry.confirmation = "CONFIRMED";
+            this.log(
+              `[EXEC] RECONCILE ${symbol}: cleared the working entry remainder ` +
+                `for paper ${entry.paperPositionId}`,
+            );
+          } else {
+            entryOrderBlocked.add(entry.paperPositionId);
+            this.log(
+              `[EXEC] ERROR RECONCILE ${symbol}: paper ` +
+                `${entry.paperPositionId} still has a working entry order; ` +
+                `exposure may still grow`,
+            );
+          }
+        } catch (error) {
+          this.log(
+            `[EXEC] ERROR RECONCILE ${symbol}: could not clear the entry ` +
+              `remainder for paper ${entry.paperPositionId}: ` +
+              `${this.adapter.redact(error)}`,
+          );
+        }
+      }
+
       const ownedHere = openOwned.filter((entry) => entry.symbol === symbol);
 
       // An owned record whose side is no longer on the venue is flat: the exit
@@ -1075,6 +1200,18 @@ export class LighterExecutionBridge {
             Math.abs(held.contracts) > OWNERSHIP_EPSILON,
         );
         if (present) continue;
+
+        // A working entry order can still (re)open this side, so a flat venue
+        // right now does not make the record closed. Keep it owned and retry
+        // the cancel on the next pass.
+        if (entryOrderBlocked.has(entry.paperPositionId)) {
+          this.log(
+            `[EXEC] ERROR RECONCILE ${symbol}: paper ` +
+              `${entry.paperPositionId} is flat but its entry order is still ` +
+              `working; not marking it closed`,
+          );
+          continue;
+        }
 
         await this.markOwnershipClosed(
           entry.paperPositionId,
@@ -1318,6 +1455,31 @@ export class LighterExecutionBridge {
         side: closeSide,
         reference: null,
         alreadyFlat,
+        remainderUnresolved: false,
+      };
+    }
+
+    // Never stack reduce-only orders on the same side. A working order can be
+    // this bot's own unfilled remainder; submitting another close would race it
+    // and make the measured fill hard to attribute. Report it as unresolved.
+    const working = await this.adapter.getOpenOrders(input.symbol);
+    const blocking = working.filter((order) => order.side === closeSide);
+    if (blocking.length > 0) {
+      this.log(
+        `[EXEC] ${input.action} ${input.symbol} close deferred: ` +
+          `${blocking.length} working ${closeSide} order(s) ` +
+          `(${blocking.map((order) => order.id ?? "?").join(", ")}); ` +
+          `not stacking another close (${input.reason})`,
+      );
+      return {
+        filled: 0,
+        remaining: before,
+        status: "UNKNOWN",
+        price: null,
+        side: closeSide,
+        reference: null,
+        alreadyFlat: false,
+        remainderUnresolved: true,
       };
     }
 
@@ -1335,6 +1497,7 @@ export class LighterExecutionBridge {
         side: closeSide,
         reference: null,
         alreadyFlat: false,
+        remainderUnresolved: false,
       };
     }
 
@@ -1345,9 +1508,32 @@ export class LighterExecutionBridge {
       amount: input.amount,
       price,
       reduceOnly: true,
+      timeInForce: "IOC",
     });
 
     const reference = orderReference(order);
+
+    // IOC should leave no remainder, but a venue that ignores it (or a partial
+    // fill on a resting order) must not stay unmanaged. Cancel the remainder
+    // and verify it is gone before trusting the measured fill.
+    let remainderUnresolved = false;
+    const workingRemainder =
+      order.status === "open" ||
+      (order.remaining !== null && order.remaining > OWNERSHIP_EPSILON);
+    if (workingRemainder) {
+      remainderUnresolved = !(await this.cancelWorkingOrder(
+        input.symbol,
+        order.id,
+      ));
+      if (remainderUnresolved) {
+        this.log(
+          `[EXEC] ERROR ${input.action} ${input.symbol} close remainder from ` +
+            `order ${reference ?? "?"} could not be cancelled; no further ` +
+            `close will be sent until it is terminal`,
+        );
+      }
+    }
+
     const after = await this.verifyClose(input.symbol, input.ownedSide);
     const filled = Math.max(0, Math.min(input.amount, before - after));
     const status = this.closeFillStatus(order, filled, input.amount);
@@ -1391,6 +1577,7 @@ export class LighterExecutionBridge {
       side: closeSide,
       reference,
       alreadyFlat: false,
+      remainderUnresolved,
     };
   }
 
@@ -1745,6 +1932,29 @@ export class LighterExecutionBridge {
 
     for (const entry of owned) {
       let resolved = false;
+      let entryOrderUncleared = false;
+
+      // A working entry remainder could add size after this pass. Clear it
+      // before flattening, and never report a clean shutdown if it survives.
+      if (entry.confirmation !== "CONFIRMED") {
+        try {
+          entryOrderUncleared = !(await this.cancelPendingEntry(entry));
+        } catch (error) {
+          entryOrderUncleared = true;
+          this.log(
+            `[EXEC] ERROR ${action} could not clear the entry remainder on ` +
+              `${entry.symbol} (paper ${entry.paperPositionId}): ` +
+              `${this.adapter.redact(error)}`,
+          );
+        }
+        if (entryOrderUncleared) {
+          this.log(
+            `[EXEC] ERROR ${action} ${entry.symbol} entry order for paper ` +
+              `${entry.paperPositionId} is still working; a later fill would ` +
+              `add exposure after shutdown`,
+          );
+        }
+      }
 
       for (let attempt = 1; attempt <= SHUTDOWN_FLATTEN_ATTEMPTS; attempt++) {
         // A thrown order, price or position error must not abort the remaining
@@ -1795,6 +2005,15 @@ export class LighterExecutionBridge {
             break;
           }
 
+          if (outcome.remainderUnresolved) {
+            this.log(
+              `[EXEC] ERROR ${action} ${entry.symbol} attempt ` +
+                `${attempt}/${SHUTDOWN_FLATTEN_ATTEMPTS} is blocked by a ` +
+                `working close order; not stacking another`,
+            );
+            break;
+          }
+
           this.log(
             `[EXEC] ${action} ${entry.symbol} attempt ${attempt}/${SHUTDOWN_FLATTEN_ATTEMPTS} ` +
               `left ${outcome.remaining}; retrying`,
@@ -1816,11 +2035,15 @@ export class LighterExecutionBridge {
         const current = await this
           .loadOwnership(entry.paperPositionId)
           .catch(() => null);
-        if (current) residual.push(current);
+        // A failed registry read is not evidence of zero exposure: fall back to
+        // the row already in hand so shutdown never claims success without it.
+        residual.push(current ?? entry);
         this.log(
           `[EXEC] ERROR ${action} could not flatten ${entry.symbol} ` +
             `(paper ${entry.paperPositionId}); venue position remains open`,
         );
+      } else if (entryOrderUncleared) {
+        residual.push(entry);
       }
     }
 

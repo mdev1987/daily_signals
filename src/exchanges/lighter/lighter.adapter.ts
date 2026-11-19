@@ -328,6 +328,12 @@ export class LighterAdapter implements ExchangeAdapter {
       );
     }
 
+    // Lighter defaults to GTT, so an intended market order would rest on the
+    // book and could fill after the bridge stopped tracking it. Market orders
+    // are therefore sent as IOC unless the caller asks for something else.
+    const timeInForce =
+      request.timeInForce ?? (request.type === "market" ? "IOC" : "GTC");
+
     const order = await (await this.getPrivateClient()).createOrder(
       request.symbol,
       request.type,
@@ -335,6 +341,7 @@ export class LighterAdapter implements ExchangeAdapter {
       request.amount,
       request.price,
       {
+        timeInForce,
         ...(request.clientOrderId
           ? { clientOrderId: request.clientOrderId }
           : {}),

@@ -614,6 +614,13 @@ is the registry, keyed by `paper_position_id`:
   the order id / transaction hash (`lighter_executions`). A close is classified
   from the measured fill first, so a canceled or expired order with a partial
   fill is `PARTIALLY_FILLED`, not `REJECTED`.
+- Every entry, close and emergency unwind asks for an explicit `IOC` market
+  order. Lighter's default is `GTT`, so an order without it can rest on the book
+  and fill after the bridge has stopped watching it.
+- A partial fill that leaves a working remainder is not treated as final: the
+  remainder is cancelled and verified gone, and the row records
+  `confirmation = UNRESOLVED` if that fails. A close is never stacked on top of
+  a working order on the same side; the position is reported instead.
 - The reconciler walks symbols from the registry as well as the config, so
   removing a symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand an owned
   position.
@@ -626,9 +633,10 @@ is the registry, keyed by `paper_position_id`:
   order id, or the single order on the intent's side) and verified gone before
   shutdown completes; a position that filled before the cancel is adopted and
   flattened, and an order that cannot be cancelled or verified is reported as an
-  unresolved pending entry rather than assumed flat. Any residual position is
-  logged as an error with its symbol and size; a shutdown that could not
-  flatten does not claim success. `SIGKILL`, machine failure and network loss
+  unresolved pending entry rather than assumed flat. If the ownership registry
+  cannot be re-read at the end, the row already in hand is reported, never
+  treated as flat. Any residual position is logged as an error with its symbol
+  and size; a shutdown that could not flatten does not claim success. `SIGKILL`, machine failure and network loss
   cannot run this policy, which is why exchange-side stops are still required.
 - At week end, every paper position is liquidated even without a fresh quote
   (last stored candle, then entry price), so the mirror is not left open.
