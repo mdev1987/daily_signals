@@ -143,6 +143,8 @@ export interface Order {
   side: OrderSide;
   price: number | null;
   amount: number | null;
+  /** Venue-reported average fill price, when the venue provides one. */
+  average?: number | null;
   filled: number | null;
   remaining: number | null;
   status: OrderStatus;

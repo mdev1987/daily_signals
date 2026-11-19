@@ -326,6 +326,15 @@ function readExecutionConfig(
     );
   }
 
+  // Scaling the paper size is only meant to clear a venue minimum. Without a
+  // cap that multiplier could open a position far larger than the $20 paper
+  // trade it mirrors, so the combination is refused rather than defaulted.
+  if (sizeMultiplier > 1 && maxNotionalUsd === 0) {
+    throw new ExchangeConfigurationError(
+      "LIGHTER_MAX_NOTIONAL_USD must be set when LIGHTER_SIZE_MULTIPLIER > 1",
+    );
+  }
+
   return {
     enabled: readBoolean(env.LIGHTER_EXECUTION_ENABLED, false),
     leverage,

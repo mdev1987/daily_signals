@@ -330,7 +330,7 @@ LIGHTER_LEVERAGE=5
 LIGHTER_MARGIN_MODE=cross
 LIGHTER_EXECUTION_SYMBOLS=BTC,ETH
 LIGHTER_SIZE_MULTIPLIER=1
-LIGHTER_MAX_NOTIONAL_USD=0
+LIGHTER_MAX_NOTIONAL_USD=100
 LIGHTER_FLATTEN_ON_SHUTDOWN=true
 LIGHTER_WORST_PRICE_SLIPPAGE_PCT=1
 LIGHTER_ALLOW_MAINNET_EXECUTION=false
@@ -569,12 +569,12 @@ and execution costs (Phase 8). Live trading stays disabled on all venues.
 
 ### Execution safety additions
 
-- `LIGHTER_SIZE_MULTIPLIER` (default 1) scales the paper quantity sent to the venue; `LIGHTER_MAX_NOTIONAL_USD` caps a single entry independently.
+- `LIGHTER_SIZE_MULTIPLIER` (default 1) scales the paper quantity sent to the venue; `LIGHTER_MAX_NOTIONAL_USD` caps a single entry independently. A multiplier above 1 is refused at startup unless the cap is nonzero.
 - `connect()` refuses a leverage whose liquidation distance is under 2x the paper stop loss, and refuses to start if the venue rejects the leverage.
 - Opens are skipped (audited as `SKIPPED`) when the venue already holds a position on the symbol, has a resting order there, margin is insufficient, the balance is unavailable, leverage was not applied, or the size is below the venue minimum.
-- `connect()` fails closed when the venue rejects the leverage, so the process stays paper-only instead of trading at an unknown account leverage.
-- After a fill, the venue-reported leverage is compared with the configured value; a higher value triggers an immediate reduce-only unwind.
-- Closes are skipped when the venue has no position; closes are always reduce-only.
+- After a fill, the venue-reported leverage is compared with the configured value; a higher value moves the ownership row to `UNWIND_PENDING` and starts a reduce-only unwind. `CLOSED` is only written once the venue confirms the position is flat; otherwise reconcile retries it. A venue that reports no leverage is logged as unverified.
+- Closing orders are not assumed to fill. Each close compares the venue position before and after and records `FILLED`, `PARTIALLY_FILLED`, `UNKNOWN` or `REJECTED` with the observed fill and remaining size; ownership advances only by the confirmed fill.
+- Closes are always reduce-only and are skipped when the venue has no position.
 
 ### Position ownership
 
@@ -595,8 +595,12 @@ is the registry, keyed by `paper_position_id`:
 - The reconciler walks symbols from the registry as well as the config, so
   removing a symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand an owned
   position.
-- On a clean shutdown, `LIGHTER_FLATTEN_ON_SHUTDOWN=true` closes owned positions
-  before the client disconnects. `SIGKILL` cannot run this policy.
+- On a clean shutdown, `LIGHTER_FLATTEN_ON_SHUTDOWN=true` re-reads each owned
+  position and retries a reduce-only close up to three times before the client
+  disconnects. Any residual position is logged as an error with its symbol and
+  size; a shutdown that could not flatten does not claim success. `SIGKILL`,
+  machine failure and network loss cannot run this policy, which is why
+  exchange-side stops are still required.
 - At week end, every paper position is liquidated even without a fresh quote
   (last stored candle, then entry price), so the mirror is not left open.
 
@@ -611,3 +615,10 @@ Two consequences are deliberate:
 
 Not implemented: venue-side stop-loss/take-profit orders; stops are still
 evaluated by the paper engine on closed 5m candles.
+
+### Review archives
+
+`bun run review:archive` writes `code-review.zip` from `git archive HEAD`.
+Only tracked files are included, so `.env`, `.cache/` and `node_modules/` are
+never part of an archive. Do not zip the working directory by hand: an
+untracked `.env` would be included and any secret in it must then be rotated.

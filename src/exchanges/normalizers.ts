@@ -306,6 +306,7 @@ export interface RawOrder {
   side?: string | null;
   price?: number | null;
   amount?: number | null;
+  average?: number | null;
   filled?: number | null;
   remaining?: number | null;
   status?: string | null;
@@ -346,6 +347,7 @@ export function normalizeOrder(raw: RawOrder): Order | null {
     side,
     price: finite(raw.price),
     amount: finite(raw.amount),
+    average: finite(raw.average),
     filled: finite(raw.filled),
     remaining: finite(raw.remaining),
     status: normalizeStatus(raw.status),

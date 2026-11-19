@@ -31,6 +31,12 @@ interface FakeOptions {
   fillRatio?: number;
   /** Leverage the venue reports on the resulting position. */
   reportedLeverage?: number;
+  /** Fraction of a reduce-only close that fills (default 1). */
+  closeFillRatio?: number;
+  /** Make reduce-only orders throw, as a rejected signing request would. */
+  closeError?: boolean;
+  /** Return a rejected order without closing anything. */
+  closeReject?: boolean;
 }
 
 function fakeAdapter(opts: FakeOptions = {}) {
@@ -39,6 +45,7 @@ function fakeAdapter(opts: FakeOptions = {}) {
 
   const adapter: any = {
     orders,
+    options: opts,
     positions: [...(opts.positions ?? [])],
     closed: false,
     redact: (e: unknown) => String(e),
@@ -75,11 +82,29 @@ function fakeAdapter(opts: FakeOptions = {}) {
       orders.push(req);
 
       if (req.reduceOnly) {
+        if (opts.closeError) throw new Error("close order rejected");
+
         const target = req.side === "sell" ? "long" : "short";
-        adapter.positions = adapter.positions.filter(
-          (position: any) =>
-            !(position.symbol === req.symbol && position.side === target),
-        );
+        const ratio = opts.closeReject ? 0 : (opts.closeFillRatio ?? 1);
+        let filled = 0;
+
+        adapter.positions = adapter.positions
+          .map((position: any) => {
+            if (position.symbol !== req.symbol || position.side !== target) {
+              return position;
+            }
+            const closed = Math.min(
+              Math.abs(position.contracts),
+              req.amount * ratio,
+            );
+            filled += closed;
+            return {
+              ...position,
+              contracts: Math.abs(position.contracts) - closed,
+            };
+          })
+          .filter((position: any) => Math.abs(position.contracts) > 0);
+
         return {
           id: `o${orders.length}`,
           clientOrderId: null,
@@ -88,9 +113,9 @@ function fakeAdapter(opts: FakeOptions = {}) {
           side: req.side,
           price: req.price ?? null,
           amount: req.amount,
-          filled: req.amount,
-          remaining: 0,
-          status: "closed",
+          filled,
+          remaining: req.amount - filled,
+          status: opts.closeReject ? "rejected" : "closed",
           timestamp: null,
           raw: null,
         };
@@ -171,7 +196,10 @@ describe("Lighter bridge ownership", () => {
 
   test("size multiplier scales the venue quantity", async () => {
     const a = fakeAdapter();
-    const { bridge } = await makeBridge(a, { LIGHTER_SIZE_MULTIPLIER: "5" });
+    const { bridge } = await makeBridge(a, {
+      LIGHTER_SIZE_MULTIPLIER: "5",
+      LIGHTER_MAX_NOTIONAL_USD: "1000",
+    });
     bridge.onOpen(paper());
     await bridge.flush();
     expect(a.orders[0].amount).toBe(0.005);
@@ -364,6 +392,23 @@ describe("Lighter bridge reconcile", () => {
     expect(a.orders[1]).toMatchObject({ side: "sell", reduceOnly: true });
   });
 
+  test("reconcile closes an owned record that is flat beside an unrelated position", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    // The bot's long is gone; a manual short is now the only venue position.
+    a.positions = [{ symbol: SYMBOL, side: "short", contracts: 0.002 }];
+    bridge.reconcile([]);
+    await bridge.flush();
+
+    expect(a.orders).toHaveLength(1);
+    expect(a.positions).toHaveLength(1);
+    expect(a.positions[0].side).toBe("short");
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+  });
+
   test("reconcile does not close an owned position paper still tracks", async () => {
     const a = fakeAdapter();
     const { bridge } = await makeBridge(a);
@@ -403,5 +448,178 @@ describe("Lighter bridge shutdown and leverage guard", () => {
     bridge.onOpen(paper({ symbol: "BTC/ZAR" }));
     await bridge.flush();
     expect(a.orders).toHaveLength(0);
+  });
+});
+
+async function ownershipOf(connection: any, id = "p1") {
+  const result = await connection.runAndReadAll(
+    "SELECT status, filled_amount, closed_amount FROM lighter_owned_positions WHERE paper_position_id = ?",
+    [id],
+  );
+  return result.getRowObjects()[0] as
+    | { status: string; filled_amount: number; closed_amount: number }
+    | undefined;
+}
+
+describe("Lighter bridge failure handling", () => {
+  test("an unwind that finds no price keeps ownership pending", async () => {
+    const a = fakeAdapter({ reportedLeverage: 25 });
+    const { bridge, connection } = await makeBridge(a);
+
+    // The entry has a price; the unwind does not. This is the state a halted
+    // or one-sided book leaves the bridge in after a fill.
+    const realWorst = (bridge as any).worstPrice.bind(bridge);
+    (bridge as any).worstPrice = async (
+      symbol: string,
+      side: "buy" | "sell",
+    ) => (side === "sell" ? null : realWorst(symbol, side));
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(a.positions).toHaveLength(1);
+    expect((await ownershipOf(connection))?.status).toBe("UNWIND_PENDING");
+  });
+
+  test("a rejected unwind keeps ownership pending for reconcile", async () => {
+    const a = fakeAdapter({ reportedLeverage: 25, closeError: true });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "UNWIND_PENDING",
+      filled_amount: 0.001,
+      closed_amount: 0,
+    });
+  });
+
+  test("a partially filled unwind advances ownership and stays pending", async () => {
+    const a = fakeAdapter({ reportedLeverage: 25, closeFillRatio: 0.25 });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    // Two attempts each fill a quarter of what is left; the row must not be
+    // reported as closed while the venue still holds contracts.
+    const row = await ownershipOf(connection);
+    expect(row?.status).toBe("UNWIND_PENDING");
+    expect(row?.filled_amount).toBe(0.001);
+    expect(row?.closed_amount).toBeCloseTo(0.0004375, 9);
+    expect(a.positions).toHaveLength(1);
+
+    a.options.closeFillRatio = 1;
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect(a.positions).toHaveLength(0);
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+  });
+
+  test("reconcile finishes a pending unwind even while paper is open", async () => {
+    const a = fakeAdapter({ reportedLeverage: 25, closeFillRatio: 0 });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    expect((await ownershipOf(connection))?.status).toBe("UNWIND_PENDING");
+
+    a.options.closeFillRatio = 1;
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect(a.positions).toHaveLength(0);
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+  });
+
+  test("a partial close advances ownership by the actual fill", async () => {
+    const a = fakeAdapter({ closeFillRatio: 0.5 });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    bridge.onClose(paper(), "STOP_LOSS");
+    await bridge.flush();
+
+    expect(await ownershipOf(connection)).toMatchObject({
+      status: "OPEN",
+      filled_amount: 0.001,
+      closed_amount: 0.0005,
+    });
+
+    // Reconcile sees paper closed and closes the remainder.
+    a.options.closeFillRatio = 1;
+    bridge.reconcile([]);
+    await bridge.flush();
+
+    expect(a.positions).toHaveLength(0);
+    expect((await ownershipOf(connection))?.status).toBe("CLOSED");
+  });
+
+  test("a zero-fill close is recorded as UNKNOWN and keeps ownership", async () => {
+    const a = fakeAdapter({ closeFillRatio: 0 });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    bridge.onClose(paper(), "STOP_LOSS");
+    await bridge.flush();
+
+    expect((await ownershipOf(connection))?.status).toBe("OPEN");
+
+    const executions = await connection.runAndReadAll(
+      "SELECT status, filled_amount FROM lighter_executions WHERE action = 'CLOSE'",
+    );
+    expect(executions.getRowObjects()[0]).toMatchObject({
+      status: "UNKNOWN",
+      filled_amount: 0,
+    });
+  });
+
+  test("a rejected close is recorded as REJECTED and returns no fill", async () => {
+    const a = fakeAdapter({ closeReject: true });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    bridge.onClose(paper(), "STOP_LOSS");
+    await bridge.flush();
+
+    expect((await ownershipOf(connection))?.status).toBe("OPEN");
+    const executions = await connection.runAndReadAll(
+      "SELECT status, filled_amount FROM lighter_executions WHERE action = 'CLOSE'",
+    );
+    expect(executions.getRowObjects()[0]).toMatchObject({
+      status: "REJECTED",
+      filled_amount: 0,
+    });
+  });
+
+  test("shutdown retries, then reports the residual position", async () => {
+    const a = fakeAdapter({ closeFillRatio: 0 });
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    await bridge.close();
+
+    // One entry plus three flatten attempts.
+    expect(a.orders).toHaveLength(4);
+    expect(a.positions).toHaveLength(1);
+    expect((await ownershipOf(connection))?.status).toBe("OPEN");
+    expect(a.closed).toBe(true);
+  });
+
+  test("missing venue leverage is reported but does not unwind", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect(a.orders).toHaveLength(1);
+    expect((await ownershipOf(connection))?.status).toBe("OPEN");
   });
 });

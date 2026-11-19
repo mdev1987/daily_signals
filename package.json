@@ -25,7 +25,8 @@
     "lighter:markets": "EXCHANGE=lighter bun run src/market-data/market-metadata.ts",
     "lighter:backfill": "EXCHANGE=lighter bun run src/market-data/backfill-cli.ts",
     "markets": "bun run src/market-data/market-metadata.ts",
-    "backfill": "bun run src/market-data/backfill-cli.ts"
+    "backfill": "bun run src/market-data/backfill-cli.ts",
+    "review:archive": "git archive --format=zip --output=code-review.zip HEAD"
   },
   "devDependencies": {
     "@types/bun": "latest"

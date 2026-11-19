@@ -137,6 +137,19 @@ describe("Lighter configuration and order safety", () => {
     ).toThrow(ExchangeConfigurationError);
   });
 
+  test("refuses a size multiplier without a notional cap", () => {
+    expect(() =>
+      loadLighterConfig({ LIGHTER_SIZE_MULTIPLIER: "5" }),
+    ).toThrow(/LIGHTER_MAX_NOTIONAL_USD/);
+
+    const capped = loadLighterConfig({
+      LIGHTER_SIZE_MULTIPLIER: "5",
+      LIGHTER_MAX_NOTIONAL_USD: "100",
+    });
+    expect(capped.execution.sizeMultiplier).toBe(5);
+    expect(capped.execution.maxNotionalUsd).toBe(100);
+  });
+
   test("rejects unknown environments instead of guessing", () => {
     expect(() => loadLighterConfig({ LIGHTER_ENV: "staging" })).toThrow(
       ExchangeConfigurationError,

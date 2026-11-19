@@ -57,12 +57,36 @@ export interface OwnedVenuePosition {
   closedAmount: number;
   averagePrice: number | null;
   orderId: string | null;
-  /** OPEN = verified and manageable. UNVERIFIED = never claim it. */
-  status: "OPEN" | "CLOSED" | "UNVERIFIED";
+  /**
+   * OPEN = verified and manageable. UNVERIFIED = never claim it.
+   * UNWIND_PENDING = a risk check failed after the fill; reconcile must close
+   * it even while paper still shows the position as open.
+   */
+  status: "OPEN" | "CLOSED" | "UNVERIFIED" | "UNWIND_PENDING";
 }
 
 /** Amounts below this are treated as fully closed (venue size steps). */
 const OWNERSHIP_EPSILON = 1e-9;
+
+/** Attempts for a shutdown flatten, with a pause between them. */
+const SHUTDOWN_FLATTEN_ATTEMPTS = 3;
+
+/** Audit status for one closing order, based on observed fills. */
+export type CloseFillStatus =
+  | "FILLED"
+  | "PARTIALLY_FILLED"
+  | "UNKNOWN"
+  | "REJECTED";
+
+interface CloseOutcome {
+  filled: number;
+  /** Contracts still open on the owned side after the order. */
+  remaining: number;
+  status: CloseFillStatus;
+  price: number | null;
+  side: "buy" | "sell";
+  reference: string | null;
+}
 
 export interface LighterExecutionBridgeOptions {
   connection: DatabaseConnection;
@@ -250,7 +274,22 @@ export class LighterExecutionBridge {
 
     if (this.config.execution.flattenOnShutdown) {
       try {
-        await this.flattenOwned("SHUTDOWN_CLOSE");
+        const residual = await this.flattenOwned("SHUTDOWN_CLOSE");
+        if (residual.length > 0) {
+          const detail = residual
+            .map(
+              (entry) =>
+                `${entry.symbol} ${entry.side} ` +
+                `${entry.filledAmount - entry.closedAmount}`,
+            )
+            .join(", ");
+          this.log(
+            `[EXEC] ERROR shutdown left bot-owned positions open: ${detail}. ` +
+              `The venue is still exposed; close them manually.`,
+          );
+        } else {
+          this.log("[EXEC] shutdown flatten complete: no bot-owned positions left");
+        }
       } catch (error) {
         this.log(
           `[EXEC] shutdown flatten failed: ${this.adapter.redact(error)}; ` +
@@ -432,53 +471,8 @@ export class LighterExecutionBridge {
       );
       const averagePrice = confirmation.entryPrice ?? order.price ?? price;
 
-      // The venue's reported leverage is derived from the position's initial
-      // margin fraction. If it exceeds the configured value the liquidation
-      // guard no longer holds, so unwind immediately instead of leaving a
-      // position whose risk the bot cannot model.
-      const actualLeverage = confirmation.leverage;
-      if (
-        actualLeverage !== null &&
-        actualLeverage > this.config.execution.leverage * 1.01
-      ) {
-        await this.recordFailure(
-          position.id,
-          "OPEN",
-          symbol,
-          side,
-          amount,
-          price,
-          new Error(
-            `venue reports ${actualLeverage.toFixed(2)}x but ` +
-              `${this.config.execution.leverage}x was requested`,
-          ),
-        );
-
-        if (filled > OWNERSHIP_EPSILON) {
-          await this.emergencyClose(
-            position,
-            symbol,
-            position.direction,
-            filled,
-            "LEVERAGE_MISMATCH",
-          );
-        }
-
-        await this.recordOwnership({
-          paperPositionId: position.id,
-          symbol,
-          side: position.direction,
-          requestedAmount: amount,
-          filledAmount: filled,
-          closedAmount: filled,
-          averagePrice,
-          orderId: reference,
-          status: filled > OWNERSHIP_EPSILON ? "CLOSED" : "UNVERIFIED",
-          now: this.now(),
-        });
-        return;
-      }
-
+      // Claim the fill before any other risk check runs. If the unwind below
+      // fails, the ownership row is what lets reconcile finish the job.
       await this.record({
         paperPositionId: position.id,
         action: "OPEN",
@@ -515,6 +509,77 @@ export class LighterExecutionBridge {
           `| filled ${filled}/${amount}`,
       );
 
+      // The venue's reported leverage is derived from the position's initial
+      // margin fraction. If it exceeds the configured value the liquidation
+      // guard no longer holds, so unwind immediately. Ownership only becomes
+      // CLOSED once the venue confirms the position is flat.
+      const actualLeverage = confirmation.leverage;
+      if (
+        actualLeverage !== null &&
+        actualLeverage > this.config.execution.leverage * 1.01
+      ) {
+        await this.recordFailure(
+          position.id,
+          "OPEN",
+          symbol,
+          side,
+          amount,
+          price,
+          new Error(
+            `venue reports ${actualLeverage.toFixed(2)}x but ` +
+              `${this.config.execution.leverage}x was requested`,
+          ),
+        );
+
+        if (filled > OWNERSHIP_EPSILON) {
+          await this.markOwnershipStatus(position.id, "UNWIND_PENDING");
+
+          // Each attempt re-reads the venue position and advances ownership by
+          // the confirmed fill only. If the venue stays exposed, the row stays
+          // UNWIND_PENDING so reconcile retries it even while paper is open.
+          let remaining = filled;
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            const outcome = await this.closeOwned({
+              paperPositionId: position.id,
+              symbol,
+              ownedSide: position.direction,
+              amount: remaining,
+              reason: "LEVERAGE_MISMATCH",
+              action: "CLOSE",
+            });
+
+            if (outcome.filled > OWNERSHIP_EPSILON) {
+              await this.addOwnershipClosed(position.id, outcome.filled);
+            }
+
+            remaining = outcome.remaining;
+            if (remaining <= OWNERSHIP_EPSILON) {
+              await this.markOwnershipClosed(position.id, "CLOSE");
+              this.log(
+                `[EXEC] ${symbol} leverage mismatch unwound on attempt ${attempt}`,
+              );
+              return;
+            }
+
+            if (attempt < 2) await this.sleep(DEFAULT_SLEEP_MS);
+          }
+
+          this.log(
+            `[EXEC] ERROR ${symbol} leverage mismatch is UNRESOLVED ` +
+              `(${remaining} still open at ${actualLeverage.toFixed(2)}x); ` +
+              `ownership stays UNWIND_PENDING and reconcile will retry`,
+          );
+          return;
+        }
+      }
+
+      if (actualLeverage === null) {
+        this.log(
+          `[EXEC] WARN ${symbol} venue did not report leverage; the ${this.config.execution.leverage}x ` +
+            `request was accepted, but the applied value is unverified`,
+        );
+      }
+
       if (filled <= OWNERSHIP_EPSILON) {
         this.log(
           `[EXEC] WARN ${symbol} entry is UNVERIFIED: no fill was observed, so ` +
@@ -540,11 +605,14 @@ export class LighterExecutionBridge {
     let price: number | null = null;
 
     try {
-      // Ownership is the hard gate: no verified OPEN record, no close. This is
-      // what keeps a manual position, or one opened by another process on the
-      // same account, untouched even when the symbol and side match.
+      // Ownership is the hard gate: no verified record, no close. This keeps a
+      // manual position, or one opened by another process on the same account,
+      // untouched even when symbol and side match.
       const owned = await this.loadOwnership(position.id);
-      if (!owned || owned.status !== "OPEN") {
+      if (
+        !owned ||
+        (owned.status !== "OPEN" && owned.status !== "UNWIND_PENDING")
+      ) {
         await this.skip(
           position,
           symbol,
@@ -572,8 +640,6 @@ export class LighterExecutionBridge {
         (candidate) => candidate.side === owned.side,
       );
 
-      // The venue is already flat (or only an unowned position remains). Never
-      // send a reduce-only order for something the bot does not own.
       if (!held) {
         const other = (await this.positionsFor(symbol))[0];
         if (other) {
@@ -599,8 +665,6 @@ export class LighterExecutionBridge {
       }
 
       const venueAmount = Math.abs(held.contracts);
-      // Close only the bot-owned size. If the venue position is larger, the
-      // excess belongs to someone else and stays untouched.
       amount = Math.min(ownedRemaining, venueAmount);
       side = owned.side === "long" ? "sell" : "buy";
 
@@ -611,49 +675,25 @@ export class LighterExecutionBridge {
         );
       }
 
-      price = await this.worstPrice(symbol, side);
-      if (price === null) {
-        throw new Error(`no usable ${side} price for ${symbol}`);
-      }
-
-      const order = await this.adapter.createOrder({
-        symbol,
-        type: "market",
-        side,
-        amount,
-        price,
-        reduceOnly: true,
-      });
-
-      const reference = orderReference(order);
-      await this.record({
+      const outcome = await this.closeOwned({
         paperPositionId: position.id,
-        action: "CLOSE",
         symbol,
-        side,
+        ownedSide: owned.side,
         amount,
-        price,
-        orderId: reference,
-        status: orderAuditStatus(order),
-        requestedAmount: amount,
-        filledAmount: amount,
-        remainingAmount: Math.max(0, ownedRemaining - amount),
-        averagePrice: order.price ?? price,
-        txHash: reference,
+        reason: exitReason,
+        action: "CLOSE",
       });
 
-      this.log(
-        `[EXEC] CLOSE ${symbol} ${side.toUpperCase()} ${amount} (reduce only) ` +
-          `@ worst ${price.toFixed(4)} | ${exitReason} | ` +
-          `order ${reference ?? "?"} ${orderAuditStatus(order)}`,
-      );
+      price = outcome.price;
+      side = outcome.side;
 
-      const stillOpen = await this.verifyClosed(symbol, owned.side);
-      if (!stillOpen) {
+      // Advance ownership only by the amount the venue actually closed.
+      if (outcome.filled > OWNERSHIP_EPSILON) {
+        await this.addOwnershipClosed(position.id, outcome.filled);
+      }
+      if (outcome.remaining <= OWNERSHIP_EPSILON) {
         await this.markOwnershipClosed(position.id, "CLOSE");
       }
-      // A partially filled close leaves the record OPEN so reconcile retries the
-      // remainder; closed_amount is only advanced when the venue confirms flat.
     } catch (error) {
       await this.recordFailure(position.id, "CLOSE", symbol, side, amount, price, error);
       throw error;
@@ -667,7 +707,7 @@ export class LighterExecutionBridge {
     const owned = await this.listOwnership();
     const openOwned = owned.filter(
       (entry) =>
-        entry.status === "OPEN" &&
+        (entry.status === "OPEN" || entry.status === "UNWIND_PENDING") &&
         entry.filledAmount - entry.closedAmount > OWNERSHIP_EPSILON,
     );
 
@@ -685,17 +725,23 @@ export class LighterExecutionBridge {
       const venue = await this.positionsFor(symbol);
       const ownedHere = openOwned.filter((entry) => entry.symbol === symbol);
 
-      if (venue.length === 0) {
-        // Every owned position on this symbol is gone at the venue. Mark it
-        // closed so it is not retried forever.
-        for (const entry of ownedHere) {
-          await this.markOwnershipClosed(entry.paperPositionId, "RECONCILE_CLOSE");
-          this.log(
-            `[EXEC] RECONCILE ${symbol}: bot-owned position for paper ` +
-              `${entry.paperPositionId} is flat on the venue`,
-          );
-        }
-        continue;
+      // An owned record whose side is no longer on the venue is flat: the exit
+      // filled, or someone closed it by hand. Mark it closed so it is not
+      // retried every interval. This is checked per entry, so an unrelated
+      // position on the other side does not keep the record alive.
+      for (const entry of ownedHere) {
+        const present = venue.some(
+          (held) =>
+            held.side === entry.side &&
+            Math.abs(held.contracts) > OWNERSHIP_EPSILON,
+        );
+        if (present) continue;
+
+        await this.markOwnershipClosed(entry.paperPositionId, "RECONCILE_CLOSE");
+        this.log(
+          `[EXEC] RECONCILE ${symbol}: bot-owned ${entry.side} for paper ` +
+            `${entry.paperPositionId} is flat on the venue`,
+        );
       }
 
       for (const held of venue) {
@@ -716,8 +762,12 @@ export class LighterExecutionBridge {
         }
         this.missingLogged.delete(`${symbol}:${held.side}`);
 
-        if (paperIds.has(match.paperPositionId)) {
-          // Paper still tracks the position; it is in sync.
+        // UNWIND_PENDING is always closed, even while paper still shows the
+        // position open, because a risk check already failed.
+        if (
+          match.status === "OPEN" &&
+          paperIds.has(match.paperPositionId)
+        ) {
           continue;
         }
 
@@ -725,44 +775,22 @@ export class LighterExecutionBridge {
         const amount = Math.min(remaining, Math.abs(held.contracts));
         if (!(amount > OWNERSHIP_EPSILON)) continue;
 
-        const side = match.side === "long" ? "sell" : "buy";
-        const price = await this.worstPrice(symbol, side);
-        if (price === null) continue;
-
-        const order = await this.adapter.createOrder({
-          symbol,
-          type: "market",
-          side,
-          amount,
-          price,
-          reduceOnly: true,
-        });
-
-        const reference = orderReference(order);
-        await this.record({
+        const outcome = await this.closeOwned({
           paperPositionId: match.paperPositionId,
-          action: "RECONCILE_CLOSE",
           symbol,
-          side,
+          ownedSide: match.side,
           amount,
-          price,
-          orderId: reference,
-          status: orderAuditStatus(order),
-          requestedAmount: amount,
-          filledAmount: amount,
-          remainingAmount: Math.max(0, remaining - amount),
-          averagePrice: order.price ?? price,
-          txHash: reference,
+          reason:
+            match.status === "UNWIND_PENDING"
+              ? "UNWIND_PENDING"
+              : "paper position ended",
+          action: "RECONCILE_CLOSE",
         });
 
-        this.log(
-          `[EXEC] RECONCILE closed bot-owned ${symbol} ${side.toUpperCase()} ` +
-            `${amount} (paper ${match.paperPositionId} is closed) ` +
-            `| order ${reference ?? "?"} ${orderAuditStatus(order)}`,
-        );
-
-        const stillOpen = await this.verifyClosed(symbol, match.side);
-        if (!stillOpen) {
+        if (outcome.filled > OWNERSHIP_EPSILON) {
+          await this.addOwnershipClosed(match.paperPositionId, outcome.filled);
+        }
+        if (outcome.remaining <= OWNERSHIP_EPSILON) {
           await this.markOwnershipClosed(match.paperPositionId, "RECONCILE_CLOSE");
         }
       }
@@ -894,75 +922,124 @@ export class LighterExecutionBridge {
     };
   }
 
-  /** Returns true when a position on the given side is still open. */
-  private async verifyClosed(
+  /** Contracts still open on the given side after the settle delay. */
+  private async verifyClose(
     symbol: string,
-    side?: "long" | "short",
-  ): Promise<boolean> {
+    side: "long" | "short",
+  ): Promise<number> {
     await this.sleep(DEFAULT_SLEEP_MS);
-    const held = (await this.positionsFor(symbol)).filter(
-      (position) => side === undefined || position.side === side,
-    );
-
-    if (held.length > 0) {
-      this.log(
-        `[EXEC] WARN ${symbol} still shows ${held[0]!.contracts} after the close order`,
-      );
-    }
-
-    return held.length > 0;
+    return (await this.positionsFor(symbol))
+      .filter((position) => position.side === side)
+      .reduce((total, position) => total + Math.abs(position.contracts), 0);
   }
 
-  /** Unwinds a position the bot just opened when a risk check fails. */
-  private async emergencyClose(
-    position: PaperExecutionPosition,
-    symbol: string,
-    ownedSide: "long" | "short",
-    amount: number,
-    reason: string,
-  ): Promise<void> {
-    const closeSide = ownedSide === "long" ? "sell" : "buy";
-    const price = await this.worstPrice(symbol, closeSide);
+  /**
+   * Sends one reduce-only close and reports what actually happened. Ownership
+   * is advanced only from `filled`, which is measured against the venue
+   * position before and after the order rather than assumed.
+   */
+  private async closeOwned(input: {
+    paperPositionId: string;
+    symbol: string;
+    ownedSide: "long" | "short";
+    amount: number;
+    reason: string;
+    action: ExecutionAction;
+  }): Promise<CloseOutcome> {
+    const closeSide = input.ownedSide === "long" ? "sell" : "buy";
+    const before = (await this.positionsFor(input.symbol))
+      .filter((position) => position.side === input.ownedSide)
+      .reduce((total, position) => total + Math.abs(position.contracts), 0);
+
+    if (!(input.amount > OWNERSHIP_EPSILON) || before <= OWNERSHIP_EPSILON) {
+      return {
+        filled: 0,
+        remaining: before,
+        status: before <= OWNERSHIP_EPSILON ? "FILLED" : "UNKNOWN",
+        price: null,
+        side: closeSide,
+        reference: null,
+      };
+    }
+
+    const price = await this.worstPrice(input.symbol, closeSide);
     if (price === null) {
       this.log(
-        `[EXEC] ERROR ${symbol} ${reason}: no usable ${closeSide} price to unwind`,
+        `[EXEC] ${input.action} ${input.symbol} skipped: no usable ` +
+          `${closeSide} price (${input.reason})`,
       );
-      return;
+      return {
+        filled: 0,
+        remaining: before,
+        status: "UNKNOWN",
+        price: null,
+        side: closeSide,
+        reference: null,
+      };
     }
 
     const order = await this.adapter.createOrder({
-      symbol,
+      symbol: input.symbol,
       type: "market",
       side: closeSide,
-      amount,
+      amount: input.amount,
       price,
       reduceOnly: true,
     });
 
     const reference = orderReference(order);
+    const after = await this.verifyClose(input.symbol, input.ownedSide);
+    const filled = Math.max(0, Math.min(input.amount, before - after));
+    const status = this.closeFillStatus(order, filled, input.amount);
+    const averagePrice = order.average ?? null;
+
     await this.record({
-      paperPositionId: position.id,
-      action: "CLOSE",
-      symbol,
+      paperPositionId: input.paperPositionId,
+      action: input.action,
+      symbol: input.symbol,
       side: closeSide,
-      amount,
+      amount: input.amount,
       price,
       orderId: reference,
-      status: orderAuditStatus(order),
-      error: `risk unwind: ${reason}`,
-      requestedAmount: amount,
-      filledAmount: amount,
-      remainingAmount: 0,
-      averagePrice: order.price ?? price,
+      status,
+      requestedAmount: input.amount,
+      filledAmount: filled,
+      remainingAmount: Math.max(0, input.amount - filled),
+      averagePrice,
       txHash: reference,
-    }).catch(() => undefined);
+    });
 
     this.log(
-      `[EXEC] ERROR ${symbol} ${reason}; unwinding ${amount} ` +
-        `| order ${reference ?? "?"} ${orderAuditStatus(order)}`,
+      `[EXEC] ${input.action} ${input.symbol} ${closeSide.toUpperCase()} ` +
+        `${filled}/${input.amount} (reduce only) @ worst ${price.toFixed(4)} | ` +
+        `${input.reason} | order ${reference ?? "?"} ${status} | remaining ${after}`,
     );
 
-    await this.verifyClosed(symbol, ownedSide);
+    return {
+      filled,
+      remaining: after,
+      status,
+      price,
+      side: closeSide,
+      reference,
+    };
+  }
+
+  private closeFillStatus(
+    order: Order,
+    filled: number,
+    requested: number,
+  ): CloseOutcome["status"] {
+    if (
+      order.status === "rejected" ||
+      order.status === "canceled" ||
+      order.status === "expired"
+    ) {
+      return "REJECTED";
+    }
+    if (filled >= requested - OWNERSHIP_EPSILON) return "FILLED";
+    if (filled > OWNERSHIP_EPSILON) return "PARTIALLY_FILLED";
+    return "UNKNOWN";
   }
 
   // -------------------------------------------------------------------------
@@ -1004,7 +1081,9 @@ export class LighterExecutionBridge {
           ? "CLOSED"
           : row.status === "UNVERIFIED"
             ? "UNVERIFIED"
-            : "OPEN",
+            : row.status === "UNWIND_PENDING"
+              ? "UNWIND_PENDING"
+              : "OPEN",
     };
   }
 
@@ -1017,7 +1096,7 @@ export class LighterExecutionBridge {
     closedAmount: number;
     averagePrice: number | null;
     orderId: string | null;
-    status: "OPEN" | "CLOSED" | "UNVERIFIED";
+    status: "OPEN" | "CLOSED" | "UNVERIFIED" | "UNWIND_PENDING";
     now: number;
   }): Promise<void> {
     await withSerializedDatabaseOperation(() =>
@@ -1051,6 +1130,41 @@ export class LighterExecutionBridge {
     );
   }
 
+  /** Advances the closed amount by a confirmed fill, capping at the fill. */
+  private async addOwnershipClosed(
+    paperPositionId: string,
+    amount: number,
+  ): Promise<void> {
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `UPDATE lighter_owned_positions
+         SET closed_amount = LEAST(filled_amount, closed_amount + ?),
+             status = CASE
+               WHEN closed_amount + ? >= filled_amount - ? THEN 'CLOSED'
+               ELSE status
+             END,
+             updated_at = ?
+         WHERE paper_position_id = ?`,
+        [amount, amount, OWNERSHIP_EPSILON, this.now(), paperPositionId],
+      ),
+    );
+  }
+
+  /** Moves an ownership row between OPEN, UNWIND_PENDING and CLOSED. */
+  private async markOwnershipStatus(
+    paperPositionId: string,
+    status: OwnedVenuePosition["status"],
+  ): Promise<void> {
+    await withSerializedDatabaseOperation(() =>
+      this.connection.run(
+        `UPDATE lighter_owned_positions
+         SET status = ?, updated_at = ?
+         WHERE paper_position_id = ?`,
+        [status, this.now(), paperPositionId],
+      ),
+    );
+  }
+
   private async markOwnershipClosed(
     paperPositionId: string,
     _reason: string,
@@ -1066,73 +1180,79 @@ export class LighterExecutionBridge {
   }
 
   /** Closes every position the registry proves the bot owns. */
-  private async flattenOwned(action: ExecutionAction): Promise<void> {
+  /**
+   * Closes every position the registry proves the bot owns.
+   *
+   * Each position gets a bounded number of attempts: the venue is re-read, the
+   * remaining owned size is recomputed, and a fresh price is taken before each
+   * order. Returns the positions that could not be flattened, so `close()` can
+   * state explicitly that the venue is still exposed.
+   */
+  private async flattenOwned(
+    action: ExecutionAction,
+  ): Promise<OwnedVenuePosition[]> {
     const owned = (await this.listOwnership()).filter(
       (entry) =>
-        entry.status === "OPEN" &&
+        (entry.status === "OPEN" || entry.status === "UNWIND_PENDING") &&
         entry.filledAmount - entry.closedAmount > OWNERSHIP_EPSILON,
     );
+    const residual: OwnedVenuePosition[] = [];
 
     for (const entry of owned) {
-      const remaining = entry.filledAmount - entry.closedAmount;
-      const held = (await this.positionsFor(entry.symbol)).find(
-        (position) => position.side === entry.side,
-      );
+      let unresolved = true;
 
-      if (!held) {
-        await this.markOwnershipClosed(entry.paperPositionId, action);
-        continue;
-      }
-
-      const amount = Math.min(remaining, Math.abs(held.contracts));
-      if (!(amount > OWNERSHIP_EPSILON)) continue;
-
-      const side = entry.side === "long" ? "sell" : "buy";
-      const price = await this.worstPrice(entry.symbol, side);
-      if (price === null) {
-        this.log(
-          `[EXEC] ${action} ${entry.symbol} skipped: no usable ${side} price`,
+      for (let attempt = 1; attempt <= SHUTDOWN_FLATTEN_ATTEMPTS; attempt++) {
+        const remaining = entry.filledAmount - entry.closedAmount;
+        const held = (await this.positionsFor(entry.symbol)).find(
+          (position) => position.side === entry.side,
         );
-        continue;
+
+        if (!held || !(remaining > OWNERSHIP_EPSILON)) {
+          await this.markOwnershipClosed(entry.paperPositionId, action);
+          unresolved = false;
+          break;
+        }
+
+        const amount = Math.min(remaining, Math.abs(held.contracts));
+        const outcome = await this.closeOwned({
+          paperPositionId: entry.paperPositionId,
+          symbol: entry.symbol,
+          ownedSide: entry.side,
+          amount,
+          reason: "shutdown",
+          action,
+        });
+
+        if (outcome.filled > OWNERSHIP_EPSILON) {
+          await this.addOwnershipClosed(entry.paperPositionId, outcome.filled);
+        }
+
+        if (outcome.remaining <= OWNERSHIP_EPSILON) {
+          await this.markOwnershipClosed(entry.paperPositionId, action);
+          unresolved = false;
+          break;
+        }
+
+        this.log(
+          `[EXEC] ${action} ${entry.symbol} attempt ${attempt}/${SHUTDOWN_FLATTEN_ATTEMPTS} ` +
+            `left ${outcome.remaining}; retrying`,
+        );
+        if (attempt < SHUTDOWN_FLATTEN_ATTEMPTS) {
+          await this.sleep(DEFAULT_SLEEP_MS);
+        }
       }
 
-      const order = await this.adapter.createOrder({
-        symbol: entry.symbol,
-        type: "market",
-        side,
-        amount,
-        price,
-        reduceOnly: true,
-      });
-
-      const reference = orderReference(order);
-      await this.record({
-        paperPositionId: entry.paperPositionId,
-        action,
-        symbol: entry.symbol,
-        side,
-        amount,
-        price,
-        orderId: reference,
-        status: orderAuditStatus(order),
-        requestedAmount: amount,
-        filledAmount: amount,
-        remainingAmount: Math.max(0, remaining - amount),
-        averagePrice: order.price ?? price,
-        txHash: reference,
-      });
-
-      this.log(
-        `[EXEC] ${action} ${entry.symbol} ${side.toUpperCase()} ${amount} ` +
-          `(reduce only) | paper ${entry.paperPositionId} ` +
-          `| order ${reference ?? "?"} ${orderAuditStatus(order)}`,
-      );
-
-      const stillOpen = await this.verifyClosed(entry.symbol, entry.side);
-      if (!stillOpen) {
-        await this.markOwnershipClosed(entry.paperPositionId, action);
+      if (unresolved) {
+        const current = await this.loadOwnership(entry.paperPositionId);
+        if (current) residual.push(current);
+        this.log(
+          `[EXEC] ERROR ${action} could not flatten ${entry.symbol} ` +
+            `(paper ${entry.paperPositionId}); venue position remains open`,
+        );
       }
     }
+
+    return residual;
   }
 
   private async readRows(
