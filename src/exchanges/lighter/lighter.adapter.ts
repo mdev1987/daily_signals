@@ -111,6 +111,26 @@ export interface LighterAdapterOptions {
  * explicitly enabled client that CCXT signs with the wasm signer. Order
  * placement is refused unless the trading gates in LighterConfig are open.
  */
+/**
+ * Lighter accepts GTT and IOC only; CCXT documents GTT as its default. Any
+ * other value (GTC, FOK) is rejected here rather than silently sent to a venue
+ * that does not understand it.
+ */
+export function resolveLighterTimeInForce(
+  request: Pick<OrderRequest, "type" | "timeInForce">,
+): "GTT" | "IOC" {
+  const requested =
+    request.timeInForce ?? (request.type === "market" ? "IOC" : "GTT");
+
+  if (requested !== "GTT" && requested !== "IOC") {
+    throw new UnsupportedOperationError(
+      `Lighter accepts only GTT and IOC time-in-force; received ${requested}`,
+    );
+  }
+
+  return requested;
+}
+
 export class LighterAdapter implements ExchangeAdapter {
   readonly id = "lighter";
 
@@ -317,6 +337,10 @@ export class LighterAdapter implements ExchangeAdapter {
   }
 
   async createOrder(request: OrderRequest): Promise<Order> {
+    // Validate the lifetime first: a value Lighter cannot honor must never be
+    // passed through to CCXT on a future limit order.
+    const timeInForce = resolveLighterTimeInForce(request);
+
     assertLighterOrderSubmissionAllowed(this.config);
 
     // Lighter signs the price into the order even for market orders: it is the
@@ -327,12 +351,6 @@ export class LighterAdapter implements ExchangeAdapter {
           "(it is the worst acceptable execution price)",
       );
     }
-
-    // Lighter defaults to GTT, so an intended market order would rest on the
-    // book and could fill after the bridge stopped tracking it. Market orders
-    // are therefore sent as IOC unless the caller asks for something else.
-    const timeInForce =
-      request.timeInForce ?? (request.type === "market" ? "IOC" : "GTC");
 
     const order = await (await this.getPrivateClient()).createOrder(
       request.symbol,

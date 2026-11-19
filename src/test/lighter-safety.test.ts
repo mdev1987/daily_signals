@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { ExchangeConfigurationError } from "../exchanges/exchange.errors";
 import { UnsupportedOperationError } from "../exchanges/exchange.errors";
 import { createExchangeAdapter } from "../exchanges/exchange.factory";
-import { LighterAdapter } from "../exchanges/lighter/lighter.adapter";
+import {
+  LighterAdapter,
+  resolveLighterTimeInForce,
+} from "../exchanges/lighter/lighter.adapter";
 import {
   assertLighterOrderSubmissionAllowed,
   describeLighterConfig,
@@ -271,6 +274,20 @@ describe("Lighter configuration and order safety", () => {
     await expect(
       adapter.cancelOrder("order-id", "BTC/USDC:USDC"),
     ).rejects.toThrow(ExchangeConfigurationError);
+  });
+
+  test("lighter market orders are IOC and limit orders default to GTT", () => {
+    expect(resolveLighterTimeInForce({ type: "market" })).toBe("IOC");
+    expect(resolveLighterTimeInForce({ type: "limit" })).toBe("GTT");
+    expect(
+      resolveLighterTimeInForce({ type: "limit", timeInForce: "IOC" }),
+    ).toBe("IOC");
+    expect(() =>
+      resolveLighterTimeInForce({ type: "limit", timeInForce: "GTC" }),
+    ).toThrow(UnsupportedOperationError);
+    expect(() =>
+      resolveLighterTimeInForce({ type: "market", timeInForce: "FOK" }),
+    ).toThrow(UnsupportedOperationError);
   });
 
   test("adapter rejects unsupported timeframes before any network call", async () => {

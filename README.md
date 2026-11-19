@@ -616,11 +616,21 @@ is the registry, keyed by `paper_position_id`:
   fill is `PARTIALLY_FILLED`, not `REJECTED`.
 - Every entry, close and emergency unwind asks for an explicit `IOC` market
   order. Lighter's default is `GTT`, so an order without it can rest on the book
-  and fill after the bridge has stopped watching it.
+  and fill after the bridge has stopped watching it. The adapter accepts only
+  `GTT` and `IOC`; anything else is rejected before it reaches CCXT, and limit
+  orders default to `GTT` rather than the unsupported `GTC`.
 - A partial fill that leaves a working remainder is not treated as final: the
   remainder is cancelled and verified gone, and the row records
   `confirmation = UNRESOLVED` if that fails. A close is never stacked on top of
   a working order on the same side; the position is reported instead.
+- After a successful cancel the venue position is read again, because the
+  remainder can fill while the cancel is in flight. Ownership records the
+  post-cancel size and entry price, not the earlier snapshot; a failed
+  post-cancel read leaves the row `UNRESOLVED` rather than recording a stale
+  size.
+- A duplicate pending intent is never discarded while its entry order can still
+  run. The order is cancelled and verified first; if that fails the intent stays
+  `PENDING` and is reported, instead of being closed as never filled.
 - The reconciler walks symbols from the registry as well as the config, so
   removing a symbol from `LIGHTER_EXECUTION_SYMBOLS` cannot strand an owned
   position.

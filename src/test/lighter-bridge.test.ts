@@ -57,6 +57,10 @@ interface FakeOptions {
   entryRemaining?: number;
   /** Report the close order as still open with an unfilled remainder. */
   closeOpenRemainder?: boolean;
+  /** Fail position reads once any order has been cancelled. */
+  positionsErrorAfterCancel?: boolean;
+  /** Additional size that fills on the entry side when a cancel is sent. */
+  extraFillOnCancel?: number;
 }
 
 function fakeAdapter(opts: FakeOptions = {}) {
@@ -66,6 +70,7 @@ function fakeAdapter(opts: FakeOptions = {}) {
   const adapter: any = {
     orders,
     cancelled: [] as string[],
+    lastEntry: null as { symbol: string; side: string } | null,
     options: opts,
     positions: [...(opts.positions ?? [])],
     closed: false,
@@ -108,17 +113,26 @@ function fakeAdapter(opts: FakeOptions = {}) {
         (candidate: any) => candidate.id === orderId,
       );
       if (opts.fillOnCancel && order) {
-        adapter.positions = [
-          ...adapter.positions,
-          {
-            symbol: order.symbol,
-            side: order.side === "buy" ? "long" : "short",
-            contracts: order.amount,
-            entryPrice: 100_000,
-            leverage: opts.reportedLeverage ?? null,
-            unrealizedPnl: 0,
-          },
-        ];
+        const side = order.side === "buy" ? "long" : "short";
+        const existing = adapter.positions.find(
+          (position: any) =>
+            position.symbol === order.symbol && position.side === side,
+        );
+        if (existing) {
+          existing.contracts += order.amount;
+        } else {
+          adapter.positions = [
+            ...adapter.positions,
+            {
+              symbol: order.symbol,
+              side,
+              contracts: order.amount,
+              entryPrice: 100_000,
+              leverage: opts.reportedLeverage ?? null,
+              unrealizedPnl: 0,
+            },
+          ];
+        }
       } else {
         adapter.cancelled.push(orderId);
       }
@@ -126,10 +140,24 @@ function fakeAdapter(opts: FakeOptions = {}) {
       opts.openOrders = (opts.openOrders ?? []).filter(
         (candidate: any) => candidate.id !== orderId,
       );
+
+      // Simulate a remainder that fills while the cancel is in flight.
+      if (opts.extraFillOnCancel && adapter.lastEntry) {
+        const side = adapter.lastEntry.side === "buy" ? "long" : "short";
+        const existing = adapter.positions.find(
+          (position: any) =>
+            position.symbol === adapter.lastEntry.symbol &&
+            position.side === side,
+        );
+        if (existing) existing.contracts += opts.extraFillOnCancel;
+      }
     },
     getPositions: async () => {
       if (opts.positionsErrorAfterSubmit && orders.length > 0) {
         throw new Error("position endpoint unavailable");
+      }
+      if (opts.positionsErrorAfterCancel && adapter.cancelled.length > 0) {
+        throw new Error("position endpoint unavailable after cancel");
       }
       return adapter.positions;
     },
@@ -192,6 +220,7 @@ function fakeAdapter(opts: FakeOptions = {}) {
         };
       }
 
+      adapter.lastEntry = { symbol: req.symbol, side: req.side };
       const filled = req.amount * fillRatio;
       adapter.positions = [
         ...adapter.positions,
@@ -1291,5 +1320,120 @@ describe("Lighter bridge order lifetime", () => {
     expect(text).toContain("could not flatten BTC/USDC:USDC");
     expect(text).toContain("shutdown left bot-owned positions open");
     expect(text).not.toContain("shutdown flatten complete");
+  });
+});
+
+describe("Lighter bridge post-cancel accounting", () => {
+  test("an entry that grows during the cancel is recorded at the final size", async () => {
+    const a = fakeAdapter({
+      fillRatio: 0.5,
+      entryStatus: "open",
+      entryRemaining: 0.0005,
+      // The cancel races a second fill of the working remainder.
+      extraFillOnCancel: 0.0005,
+    });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    expect((await ownershipOf(connection)) as any).toMatchObject({
+      status: "OPEN",
+      confirmation: "CONFIRMED",
+      filled_amount: 0.001,
+    });
+    expect(logs.join("\n")).toContain("canceled working order o1");
+  });
+
+  test("a duplicate pending intent cancels its order before closing", async () => {
+    const a = fakeAdapter();
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES ('p3', ?, 'long', 0.001, 0, 0, 0, 0, 0, 100000, 'o9', 'PENDING',
+               'INTENT', 1, 1)`,
+      [SYMBOL],
+    );
+
+    a.options.openOrders = [
+      { id: "o9", symbol: SYMBOL, side: "buy", amount: 0.001 },
+    ];
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect(a.cancelled).toContain("o9");
+    expect(a.options.openOrders).toHaveLength(0);
+    expect(await ownershipOf(connection, "p3")).toMatchObject({
+      status: "CLOSED",
+      confirmation: "FAILED",
+    });
+    expect(logs.join("\n")).toContain("covered by another owned long");
+  });
+
+  test("a duplicate pending intent is kept when its order cannot be cancelled", async () => {
+    const a = fakeAdapter({ cancelError: true });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+
+    await connection.run(
+      `INSERT INTO lighter_owned_positions
+         (paper_position_id, symbol, side, requested_amount, filled_amount,
+          closed_amount, bot_closed_amount, external_closed_amount,
+          legacy_closed_amount, average_price, order_id, status, confirmation,
+          created_at, updated_at)
+       VALUES ('p3', ?, 'long', 0.001, 0, 0, 0, 0, 0, 100000, 'o9', 'PENDING',
+               'INTENT', 1, 1)`,
+      [SYMBOL],
+    );
+
+    a.options.openOrders = [
+      { id: "o9", symbol: SYMBOL, side: "buy", amount: 0.001 },
+    ];
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect(await ownershipOf(connection, "p3")).toMatchObject({
+      status: "PENDING",
+      confirmation: "INTENT",
+    });
+    const text = logs.join("\n");
+    expect(text).toContain("still has a working order");
+    expect(text).toContain("could not cancel working order o9");
+  });
+
+  test("a failed post-cancel read keeps ownership UNRESOLVED", async () => {
+    const a = fakeAdapter({
+      fillRatio: 0.5,
+      entryStatus: "open",
+      entryRemaining: 0.0005,
+      cancelError: true,
+    });
+    const { bridge, connection, logs } = await makeBridge(a);
+
+    bridge.onOpen(paper());
+    await bridge.flush();
+    expect((await ownershipOf(connection))?.confirmation).toBe("UNRESOLVED");
+
+    a.options.cancelError = false;
+    a.options.openOrders = [
+      { id: "o1", symbol: SYMBOL, side: "buy", amount: 0.0005 },
+    ];
+    a.options.positionsErrorAfterCancel = true;
+
+    bridge.reconcile([paper()]);
+    await bridge.flush();
+
+    expect((await ownershipOf(connection))?.confirmation).toBe("UNRESOLVED");
+    expect(logs.join("\n")).toContain("could not clear or re-verify");
   });
 });

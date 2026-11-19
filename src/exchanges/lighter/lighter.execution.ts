@@ -644,18 +644,45 @@ export class LighterExecutionBridge {
       // but an unfilled remainder must never keep working after the position is
       // treated as fully owned, or a later fill would add untracked exposure.
       let remainderUnresolved = false;
+      let finalFilled = filled;
+      let finalAveragePrice = averagePrice;
       const orderRemaining = order.remaining ?? Math.max(0, amount - filled);
       if (
         filled > OWNERSHIP_EPSILON &&
         !terminalOrder &&
         (order.status === "open" || orderRemaining > OWNERSHIP_EPSILON)
       ) {
-        remainderUnresolved = !(await this.cancelWorkingOrder(symbol, order.id));
-        if (remainderUnresolved) {
+        const cleared = await this.cancelWorkingOrder(symbol, order.id);
+        if (!cleared) {
+          remainderUnresolved = true;
           this.log(
             `[EXEC] ERROR ${symbol} entry ${reference ?? "?"} left a working ` +
               `remainder that could not be cancelled; ownership stays UNRESOLVED`,
           );
+        } else {
+          // The remainder can fill while the cancel is in flight. Ownership
+          // must record the post-cancel venue size, never the earlier snapshot.
+          try {
+            const refreshed = await this.verifyOpen(
+              symbol,
+              position.direction,
+              amount,
+            );
+            finalFilled = Math.min(
+              amount,
+              Math.max(finalFilled, refreshed.filled),
+            );
+            if (refreshed.entryPrice !== null) {
+              finalAveragePrice = refreshed.entryPrice;
+            }
+          } catch (error) {
+            remainderUnresolved = true;
+            this.log(
+              `[EXEC] ERROR ${symbol} could not re-read the venue after ` +
+                `cancelling the entry remainder (${this.adapter.redact(error)}); ` +
+                `ownership stays UNRESOLVED`,
+            );
+          }
         }
       }
 
@@ -669,9 +696,9 @@ export class LighterExecutionBridge {
         orderId: reference,
         status: orderAuditStatus(order),
         requestedAmount: amount,
-        filledAmount: filled,
-        remainingAmount: Math.max(0, amount - filled),
-        averagePrice,
+        filledAmount: finalFilled,
+        remainingAmount: Math.max(0, amount - finalFilled),
+        averagePrice: finalAveragePrice,
         txHash: reference,
       });
 
@@ -680,14 +707,14 @@ export class LighterExecutionBridge {
         symbol,
         side: position.direction,
         requestedAmount: amount,
-        filledAmount: filled,
+        filledAmount: finalFilled,
         closedAmount: 0,
         botClosedAmount: 0,
         externalClosedAmount: 0,
         legacyClosedAmount: 0,
-        averagePrice,
+        averagePrice: finalAveragePrice,
         orderId: reference,
-        status: filled > OWNERSHIP_EPSILON ? "OPEN" : "UNVERIFIED",
+        status: finalFilled > OWNERSHIP_EPSILON ? "OPEN" : "UNVERIFIED",
         confirmation: remainderUnresolved ? "UNRESOLVED" : "CONFIRMED",
         now: this.now(),
       });
@@ -696,7 +723,7 @@ export class LighterExecutionBridge {
         `[EXEC] OPEN ${symbol} ${side.toUpperCase()} ${amount} @ worst ${price.toFixed(4)} ` +
           `| ${this.config.execution.leverage}x ${this.config.execution.marginMode} ` +
           `| order ${reference ?? "?"} ${orderAuditStatus(order)} ` +
-          `| filled ${filled}/${amount}`,
+          `| filled ${finalFilled}/${amount}`,
       );
 
       // The venue's reported leverage is derived from the position's initial
@@ -721,7 +748,7 @@ export class LighterExecutionBridge {
           ),
         );
 
-        if (filled > OWNERSHIP_EPSILON) {
+        if (finalFilled > OWNERSHIP_EPSILON) {
           // The row is already OPEN from the confirmed fill. A failure to mark
           // it pending must not skip the unwind or the alert below.
           await this
@@ -737,7 +764,7 @@ export class LighterExecutionBridge {
           // the confirmed fill only. A thrown order or price error is caught
           // here so the remaining attempts still run and the alert below is
           // always emitted.
-          let remaining = filled;
+          let remaining = finalFilled;
           let unresolvedReason = `${remaining} still open`;
           for (let attempt = 1; attempt <= 2; attempt++) {
             try {
@@ -937,13 +964,14 @@ export class LighterExecutionBridge {
   /**
    * Resolves one durable entry intent from venue state.
    *
-   * ADOPTED  = the venue holds a position; ownership is claimed at the venue
-   *            size. WORKING = no position but a resting order, keep waiting.
-   * UNFILLED = no position and no order, the entry never happened.
-   * DUPLICATE = another owned row already claims this side.
-   *
-   * Throws when the venue cannot be read, so the caller keeps the intent
-   * PENDING instead of discarding the trail.
+   * ADOPTED    = the venue holds a position; ownership is claimed at the
+   *              post-cancel venue size.
+   * WORKING    = a resting order exists, keep waiting.
+   * UNFILLED   = no position and no order, the entry never happened.
+   * DUPLICATE  = another owned row already claims this side and the intent's
+   *              order has been cancelled.
+   * UNRESOLVED = the venue could not be re-read after the cancel; keep the
+   *              intent PENDING instead of discarding the trail.
    */
   private async resolvePendingOwnership(
     entry: OwnedVenuePosition,
@@ -951,7 +979,7 @@ export class LighterExecutionBridge {
     claimedByAnother: boolean,
   ): Promise<{
     row: OwnedVenuePosition | null;
-    outcome: "ADOPTED" | "WORKING" | "UNFILLED" | "DUPLICATE";
+    outcome: "ADOPTED" | "WORKING" | "UNFILLED" | "DUPLICATE" | "UNRESOLVED";
   }> {
     const held = venue.find(
       (position) =>
@@ -960,22 +988,49 @@ export class LighterExecutionBridge {
     );
 
     if (held) {
+      // Cancel a working entry order before either adopting or discarding the
+      // intent. An intent must never be marked closed while its order can
+      // still execute and add exposure.
+      if (!(await this.cancelPendingEntry(entry))) {
+        return { row: null, outcome: "WORKING" };
+      }
+
       if (claimedByAnother) {
         await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
         await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
         return { row: null, outcome: "DUPLICATE" };
       }
 
-      // A working entry order can still add size to this side. Cancel and
-      // verify it before claiming the position; otherwise a post-shutdown fill
-      // would land on a record this bot already considers flat.
-      if (!(await this.cancelPendingEntry(entry))) {
-        return { row: null, outcome: "WORKING" };
+      // The cancel is not instantaneous: the remainder can fill while it is in
+      // flight. Re-read the venue so ownership records the final size rather
+      // than the pre-cancel snapshot.
+      let refreshed: Position[];
+      try {
+        refreshed = await this.positionsFor(entry.symbol);
+      } catch (error) {
+        this.log(
+          `[EXEC] ERROR ${entry.symbol} could not re-read the venue after ` +
+            `cancelling the entry order for paper ${entry.paperPositionId}: ` +
+            `${this.adapter.redact(error)}; ownership stays PENDING`,
+        );
+        return { row: null, outcome: "UNRESOLVED" };
       }
 
-      const size = Math.abs(held.contracts);
-      const entryPrice = Number.isFinite(held.entryPrice)
-        ? held.entryPrice
+      const after = refreshed.find(
+        (position) =>
+          position.side === entry.side &&
+          Math.abs(position.contracts) > OWNERSHIP_EPSILON,
+      );
+
+      if (!after) {
+        await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
+        await this.setEntryConfirmation(entry.paperPositionId, "FAILED");
+        return { row: null, outcome: "UNFILLED" };
+      }
+
+      const size = Math.abs(after.contracts);
+      const entryPrice = Number.isFinite(after.entryPrice)
+        ? after.entryPrice
         : entry.averagePrice;
       await this.adoptOwnership(entry.paperPositionId, size, entryPrice);
 
@@ -991,7 +1046,18 @@ export class LighterExecutionBridge {
       };
     }
 
-    const working = await this.adapter.getOpenOrders(entry.symbol);
+    let working: Order[];
+    try {
+      working = await this.adapter.getOpenOrders(entry.symbol);
+    } catch (error) {
+      this.log(
+        `[EXEC] ERROR ${entry.symbol} could not read open orders for paper ` +
+          `${entry.paperPositionId}: ${this.adapter.redact(error)}; ` +
+          `ownership stays PENDING`,
+      );
+      return { row: null, outcome: "UNRESOLVED" };
+    }
+
     if (working.length > 0) return { row: null, outcome: "WORKING" };
 
     await this.markOwnershipStatus(entry.paperPositionId, "CLOSED");
@@ -1145,6 +1211,12 @@ export class LighterExecutionBridge {
             `[EXEC] RECONCILE ${symbol}: pending intent ${entry.paperPositionId} ` +
               `still has a working order; keeping it PENDING`,
           );
+        } else if (result.outcome === "UNRESOLVED") {
+          this.log(
+            `[EXEC] ERROR RECONCILE ${symbol}: pending intent ` +
+              `${entry.paperPositionId} could not be re-read after cancelling ` +
+              `its order; keeping it PENDING`,
+          );
         } else {
           this.log(
             `[EXEC] RECONCILE ${symbol}: pending intent ${entry.paperPositionId} ` +
@@ -1161,14 +1233,34 @@ export class LighterExecutionBridge {
       )) {
         try {
           if (await this.cancelPendingEntry(entry)) {
-            await this.setEntryConfirmation(
-              entry.paperPositionId,
-              "CONFIRMED",
+            // Re-read the venue: the remainder can fill while the cancel is in
+            // flight, so the recorded size must come from after the cancel.
+            const held = (await this.positionsFor(symbol)).find(
+              (position) =>
+                position.side === entry.side &&
+                Math.abs(position.contracts) > OWNERSHIP_EPSILON,
             );
+
+            if (held) {
+              const size = Math.abs(held.contracts);
+              const price = Number.isFinite(held.entryPrice)
+                ? held.entryPrice
+                : entry.averagePrice;
+              await this.adoptOwnership(entry.paperPositionId, size, price);
+              entry.filledAmount = size;
+              entry.averagePrice = price;
+            } else {
+              await this.setEntryConfirmation(
+                entry.paperPositionId,
+                "CONFIRMED",
+              );
+            }
+
             entry.confirmation = "CONFIRMED";
             this.log(
               `[EXEC] RECONCILE ${symbol}: cleared the working entry remainder ` +
-                `for paper ${entry.paperPositionId}`,
+                `for paper ${entry.paperPositionId}` +
+                (held ? `; ownership refreshed to ${entry.filledAmount}` : ""),
             );
           } else {
             entryOrderBlocked.add(entry.paperPositionId);
@@ -1180,9 +1272,9 @@ export class LighterExecutionBridge {
           }
         } catch (error) {
           this.log(
-            `[EXEC] ERROR RECONCILE ${symbol}: could not clear the entry ` +
-              `remainder for paper ${entry.paperPositionId}: ` +
-              `${this.adapter.redact(error)}`,
+            `[EXEC] ERROR RECONCILE ${symbol}: could not clear or re-verify the ` +
+              `entry remainder for paper ${entry.paperPositionId}: ` +
+              `${this.adapter.redact(error)}; ownership stays UNRESOLVED`,
           );
         }
       }
@@ -1873,6 +1965,16 @@ export class LighterExecutionBridge {
           continue;
         }
 
+        if (result.outcome === "UNRESOLVED") {
+          residual.push(entry);
+          this.log(
+            `[EXEC] ERROR ${action} pending entry ${entry.paperPositionId} on ` +
+              `${entry.symbol} could not be re-read from the venue; ` +
+              `check it manually`,
+          );
+          continue;
+        }
+
         if (result.outcome !== "WORKING") continue;
 
         // An outstanding entry order can fill after the process exits, so it
@@ -1905,6 +2007,19 @@ export class LighterExecutionBridge {
           this.log(
             `[EXEC] ERROR ${action} pending entry ${entry.paperPositionId} on ` +
               `${entry.symbol} still has a working order after the cancel`,
+          );
+        } else if (after.outcome === "UNRESOLVED") {
+          residual.push(entry);
+          this.log(
+            `[EXEC] ERROR ${action} pending entry ${entry.paperPositionId} on ` +
+              `${entry.symbol} could not be verified after the cancel; ` +
+              `check it manually`,
+          );
+        } else if (after.outcome === "DUPLICATE") {
+          this.log(
+            `[EXEC] ${action} pending entry ${entry.paperPositionId} on ` +
+              `${entry.symbol} is a duplicate of another owned position; ` +
+              `its entry order was cancelled`,
           );
         } else {
           this.log(
